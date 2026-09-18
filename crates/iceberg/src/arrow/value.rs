@@ -21,7 +21,7 @@ use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
     FixedSizeListArray, Float32Array, Float64Array, Int32Array, Int64Array, LargeBinaryArray,
     LargeListArray, LargeStringArray, ListArray, MapArray, StringArray, StructArray,
-    Time64MicrosecondArray, TimestampMicrosecondArray, TimestampNanosecondArray,
+    Time64MicrosecondArray, TimestampMicrosecondArray, TimestampNanosecondArray, new_null_array,
 };
 use arrow_buffer::NullBuffer;
 use arrow_schema::{DataType, FieldRef, TimeUnit};
@@ -1140,6 +1140,14 @@ pub(crate) fn create_primitive_array_repeated(
             ))
         }
         (DataType::Null, _) => Arc::new(arrow_array::NullArray::new(num_rows)),
+
+        // --- Catch-all null arm: use arrow-rs new_null_array for any remaining DataType ---
+        // Ported from apache/iceberg-rust 3d84c8135 (#2668). Closes the nested half of #2618:
+        // a List/Map/nested-Struct column added by ALTER TABLE ADD COLUMN must read as a typed
+        // all-NULL array for files written before the ALTER. Keep this AFTER the (DataType::Null, _)
+        // arm so Null + Some(literal) resolves exactly as before.
+        (dt, None) => new_null_array(dt, num_rows),
+
         (dt, _) => {
             return Err(Error::new(
                 ErrorKind::Unexpected,
