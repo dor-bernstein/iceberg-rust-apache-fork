@@ -494,11 +494,10 @@ async fn validate_no_new_deletes_for_data_files(
             .load_manifest_list(table.file_io(), metadata)
             .await?;
         for manifest_file in manifest_list.entries() {
-            // A manifest this snapshot wrote that adds nothing (a merge or rewrite carrying
-            // entries forward as Existing) holds no new delete.
+            // Not skipped on `added_files_count`: that is the writer's own claim, and a wrong 0
+            // would hide a delete from the one check that sees this window. Entry status decides.
             if manifest_file.content != ManifestContentType::Deletes
                 || manifest_file.added_snapshot_id != snapshot.snapshot_id()
-                || !manifest_file.has_added_files()
             {
                 continue;
             }
