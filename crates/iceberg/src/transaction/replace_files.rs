@@ -40,8 +40,7 @@ use crate::{Error, ErrorKind};
 /// Iceberg field id of the `file_path` column in position delete files.
 const FIELD_ID_POSITIONAL_DELETE_FILE_PATH: i32 = 2147483546;
 
-/// Most conflicting data files named in a validation error message. The full list is
-/// in the error's `conflicting_data_files` context.
+/// Conflicts collected, and named in the error message, before the validation stops looking.
 const MAX_CONFLICTS_IN_MESSAGE: usize = 5;
 
 /// Which snapshot [`Operation`] a file replacement records.
@@ -386,19 +385,64 @@ impl<M: ReplaceFilesMode> ReplaceFilesAction<M> {
     /// the new files then carry the older sequence number, so later equality deletes still apply
     /// to them.
     ///
+    /// `snapshot_id` need not be the planning snapshot. A caller that has already judged the
+    /// snapshots up to some later `H` itself -- more precisely than this check can, for example by
+    /// reading delete files that carry no `file_path` bounds -- may pass `H`, so that only what
+    /// landed after its own check is judged here. Everything up to `H` is then the caller's
+    /// responsibility.
+    ///
     /// A conflict, or a `snapshot_id` that is not an ancestor of the branch head, fails the commit
-    /// with [`ErrorKind::PreconditionFailed`], which is not retryable.
+    /// with [`ErrorKind::PreconditionFailed`], which is not retryable; tell the two apart with
+    /// [`rewrite_validation_failure`].
     pub fn validate_from_snapshot(mut self, snapshot_id: i64) -> Self {
         self.validate_from_snapshot_id = Some(snapshot_id);
         self
     }
 }
 
+/// Why [`ReplaceFilesAction::validate_from_snapshot`] refused a commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RewriteValidationFailure {
+    /// A snapshot after the validation start added a delete that may apply to a removed data
+    /// file. Re-planning, or re-judging that snapshot more precisely and validating from it, can
+    /// succeed.
+    ConcurrentDeletes,
+    /// The validation start is not an ancestor of the branch head (expired, rolled back, or the
+    /// branch is empty), so what happened since cannot be known. Retrying cannot help.
+    UntraceableHistory,
+}
+
+/// Classify an error raised by [`ReplaceFilesAction::validate_from_snapshot`]; `None` for any
+/// other error, including other `PreconditionFailed`s on the commit path.
+pub fn rewrite_validation_failure(err: &Error) -> Option<RewriteValidationFailure> {
+    if err.kind() != ErrorKind::PreconditionFailed {
+        return None;
+    }
+    if err.message().starts_with(CONCURRENT_DELETES_PREFIX) {
+        Some(RewriteValidationFailure::ConcurrentDeletes)
+    } else if err.message().starts_with(UNTRACEABLE_HISTORY_PREFIX) {
+        Some(RewriteValidationFailure::UntraceableHistory)
+    } else {
+        None
+    }
+}
+
+const CONCURRENT_DELETES_PREFIX: &str =
+    "Cannot commit the rewrite: a delete committed after snapshot";
+const UNTRACEABLE_HISTORY_PREFIX: &str = "Cannot validate the rewrite from snapshot";
+
+/// `path` without its scheme. Writers in one table have spelled the same object `s3://` and
+/// `s3a://`, and a reader still applies such a delete, so matching must ignore the scheme.
+fn without_scheme(path: &str) -> &str {
+    path.split_once("://").map_or(path, |(_, rest)| rest)
+}
+
 /// Fail if a snapshot after `starting_snapshot_id` on `branch` added a delete that may apply to
 /// one of `removed_data_files`.
 ///
 /// Each snapshot is judged by the manifests it wrote itself (`added_snapshot_id`), read from its
-/// own manifest list, so a later manifest rewrite cannot hide the entry.
+/// own manifest list, so a later manifest rewrite cannot hide the entry. Stops at the first
+/// [`MAX_CONFLICTS_IN_MESSAGE`] conflicts: one is enough to refuse.
 async fn validate_no_new_deletes_for_data_files(
     table: &Table,
     branch: &str,
@@ -409,15 +453,19 @@ async fn validate_no_new_deletes_for_data_files(
     if removed_data_files.is_empty() {
         return Ok(());
     }
-    let removed: HashSet<&str> = removed_data_files.iter().map(|f| f.file_path()).collect();
+    let removed: HashSet<&str> = removed_data_files
+        .iter()
+        .map(|f| without_scheme(f.file_path()))
+        .collect();
     let metadata = table.metadata();
-    let Some(head) = metadata.snapshot_for_ref(branch) else {
-        return Err(Error::new(
+    let untraceable = |why: String| {
+        Error::new(
             ErrorKind::PreconditionFailed,
-            format!(
-                "Cannot validate the rewrite from snapshot {starting_snapshot_id}: branch {branch} has no snapshot"
-            ),
-        ));
+            format!("{UNTRACEABLE_HISTORY_PREFIX} {starting_snapshot_id}: {why}"),
+        )
+    };
+    let Some(head) = metadata.snapshot_for_ref(branch) else {
+        return Err(untraceable(format!("branch {branch} has no snapshot")));
     };
 
     let mut newer = Vec::new();
@@ -434,23 +482,23 @@ async fn validate_no_new_deletes_for_data_files(
         newer.push(snapshot);
     }
     if !reached_start {
-        return Err(Error::new(
-            ErrorKind::PreconditionFailed,
-            format!(
-                "Cannot validate the rewrite: snapshot {starting_snapshot_id} is not an ancestor of {branch} head {}",
-                head.snapshot_id()
-            ),
-        ));
+        return Err(untraceable(format!(
+            "it is not an ancestor of {branch} head {}",
+            head.snapshot_id()
+        )));
     }
 
     let mut conflicts: Vec<String> = Vec::new();
-    for snapshot in &newer {
+    'snapshots: for snapshot in &newer {
         let manifest_list = snapshot
             .load_manifest_list(table.file_io(), metadata)
             .await?;
         for manifest_file in manifest_list.entries() {
+            // A manifest this snapshot wrote that adds nothing (a merge or rewrite carrying
+            // entries forward as Existing) holds no new delete.
             if manifest_file.content != ManifestContentType::Deletes
                 || manifest_file.added_snapshot_id != snapshot.snapshot_id()
+                || !manifest_file.has_added_files()
             {
                 continue;
             }
@@ -466,6 +514,9 @@ async fn validate_no_new_deletes_for_data_files(
                         snapshot.snapshot_id(),
                         delete_file.file_path()
                     ));
+                    if conflicts.len() >= MAX_CONFLICTS_IN_MESSAGE {
+                        break 'snapshots;
+                    }
                 }
             }
         }
@@ -474,27 +525,22 @@ async fn validate_no_new_deletes_for_data_files(
     if conflicts.is_empty() {
         return Ok(());
     }
-    let shown = conflicts
-        .iter()
-        .take(MAX_CONFLICTS_IN_MESSAGE)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(", ");
     Err(Error::new(
         ErrorKind::PreconditionFailed,
         format!(
-            "Cannot commit the rewrite: {} delete(s) committed after snapshot {starting_snapshot_id} apply to data files it removes: {shown}",
-            conflicts.len()
+            "{CONCURRENT_DELETES_PREFIX} {starting_snapshot_id} applies to data files it removes: {}",
+            conflicts.join(", ")
         ),
-    )
-    .with_context("conflicting_data_files", conflicts.join("\n")))
+    ))
 }
 
-/// The removed data files `delete_file` may apply to.
+/// The removed data files `delete_file` may apply to, as scheme-less paths.
 ///
 /// A position delete or deletion vector names its data file through `referenced_data_file`, or
 /// through equal `file_path` bounds; otherwise the bounds are a range, and every removed file
-/// inside it may be a target. A position delete with no bounds may target any removed file.
+/// inside it may be a target. A position delete with no bounds may target any removed file --
+/// DuckDB writes those, so a caller that can read the delete file should judge such snapshots
+/// itself and validate only from after them.
 fn delete_targets<'a>(
     delete_file: &DataFile,
     removed: &HashSet<&'a str>,
@@ -506,7 +552,11 @@ fn delete_targets<'a>(
         DataContentType::EqualityDeletes => removed.iter().copied().collect(),
         DataContentType::PositionDeletes => {
             if let Some(path) = delete_file.referenced_data_file() {
-                return removed.get(path.as_str()).copied().into_iter().collect();
+                return removed
+                    .get(without_scheme(&path))
+                    .copied()
+                    .into_iter()
+                    .collect();
             }
             let bound = |bounds: &HashMap<i32, crate::spec::Datum>| {
                 bounds
@@ -518,11 +568,14 @@ fn delete_targets<'a>(
                 bound(delete_file.lower_bounds()),
                 bound(delete_file.upper_bounds()),
             ) {
-                (Some(lower), Some(upper)) => removed
-                    .iter()
-                    .copied()
-                    .filter(|path| lower.as_str() <= *path && *path <= upper.as_str())
-                    .collect(),
+                (Some(lower), Some(upper)) => {
+                    let (lower, upper) = (without_scheme(&lower), without_scheme(&upper));
+                    removed
+                        .iter()
+                        .copied()
+                        .filter(|path| lower <= *path && *path <= upper)
+                        .collect()
+                }
                 _ => removed.iter().copied().collect(),
             }
         }
@@ -599,10 +652,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        FIELD_ID_POSITIONAL_DELETE_FILE_PATH, Overwrite, ReplaceFilesMode, ReplaceFilesOperation,
-        Rewrite, delete_targets, validate_no_new_deletes_for_data_files,
+        CONCURRENT_DELETES_PREFIX, FIELD_ID_POSITIONAL_DELETE_FILE_PATH, Overwrite,
+        ReplaceFilesMode, ReplaceFilesOperation, Rewrite, RewriteValidationFailure, delete_targets,
+        rewrite_validation_failure, validate_no_new_deletes_for_data_files, without_scheme,
     };
-    use crate::ErrorKind;
     use crate::catalog::MockCatalog;
     use crate::error::Result;
     use crate::spec::{
@@ -617,6 +670,7 @@ mod tests {
         make_v2_table_with_delete_manifest, position_delete_file,
     };
     use crate::transaction::{ApplyTransactionAction, Transaction, TransactionAction};
+    use crate::{Error, ErrorKind};
 
     #[test]
     fn test_modes_map_to_their_operations() {
@@ -887,7 +941,15 @@ mod tests {
         let err = result.expect_err("the rewrite must be refused");
         assert_eq!(err.kind(), ErrorKind::PreconditionFailed, "{err}");
         assert!(!err.retryable(), "a conflict must not be retried: {err}");
-        assert!(err.message().contains(REWRITTEN_DATA_FILE), "{err}");
+        assert_eq!(
+            rewrite_validation_failure(&err),
+            Some(RewriteValidationFailure::ConcurrentDeletes),
+            "{err}"
+        );
+        assert!(
+            err.message().contains(without_scheme(REWRITTEN_DATA_FILE)),
+            "{err}"
+        );
     }
 
     /// The action-level wiring: a rewrite planned at the parent, committed against a table that
@@ -1053,6 +1115,63 @@ mod tests {
             .expect_err("an untraceable history must refuse");
         assert_eq!(err.kind(), ErrorKind::PreconditionFailed, "{err}");
         assert!(!err.retryable());
+        assert_eq!(
+            rewrite_validation_failure(&err),
+            Some(RewriteValidationFailure::UntraceableHistory),
+            "{err}"
+        );
+    }
+
+    /// The same object spelled `s3a://` in the delete and `s3://` in the manifest is still the
+    /// same file: a reader applies the delete, so the rewrite must not strand it.
+    #[tokio::test]
+    async fn test_a_scheme_mismatch_still_names_the_data_file() {
+        let base = make_v2_table_with_delete_manifest().await;
+        let s3a = REWRITTEN_DATA_FILE.replacen("s3://", "s3a://", 1);
+        let table = table_with_concurrent_deletes(vec![position_delete(
+            &base,
+            "s3://bucket/deletes/d1.parquet",
+            Some(&s3a),
+            None,
+        )])
+        .await;
+        assert_conflict(validate(&table, PARENT_SNAPSHOT_ID, true).await);
+
+        let table = table_with_concurrent_deletes(vec![position_delete(
+            &base,
+            "s3://bucket/deletes/d2.parquet",
+            None,
+            Some((&s3a, &s3a)),
+        )])
+        .await;
+        assert_conflict(validate(&table, PARENT_SNAPSHOT_ID, true).await);
+    }
+
+    /// A caller that judged the concurrent snapshot itself validates from after it: a bounds-less
+    /// delete it has already placed elsewhere no longer refuses the commit.
+    #[tokio::test]
+    async fn test_validating_from_a_later_snapshot_skips_what_the_caller_judged() {
+        let base = make_v2_table_with_delete_manifest().await;
+        let table = table_with_concurrent_deletes(vec![position_delete(
+            &base,
+            "s3://bucket/deletes/duckdb-style.parquet",
+            None,
+            None,
+        )])
+        .await;
+        assert_conflict(validate(&table, PARENT_SNAPSHOT_ID, true).await);
+        validate(&table, CHILD_SNAPSHOT_ID, true).await.unwrap();
+    }
+
+    #[test]
+    fn test_other_errors_are_not_rewrite_validation_failures() {
+        for err in [
+            Error::new(ErrorKind::PreconditionFailed, "No added data files found"),
+            Error::new(ErrorKind::DataInvalid, CONCURRENT_DELETES_PREFIX),
+            Error::new(ErrorKind::CatalogCommitConflicts, "Commit conflict"),
+        ] {
+            assert_eq!(rewrite_validation_failure(&err), None, "{err}");
+        }
     }
 
     #[test]
