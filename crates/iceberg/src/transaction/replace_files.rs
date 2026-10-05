@@ -460,8 +460,10 @@ fn without_scheme(path: &str) -> &str {
 /// manifests. Attributed by manifest, never by the entry's `snapshot_id`, which some writers
 /// (pyiceberg < 0.10 deletes, 0.11.1 overwrites) stamp with the original adding snapshot.
 ///
-/// Deletes are reported ahead of removals when both occur. Stops at the first
-/// [`MAX_CONFLICTS_IN_MESSAGE`] of either kind: one is enough to refuse.
+/// Stops once either kind reaches [`MAX_CONFLICTS_IN_MESSAGE`]: one is enough to refuse. Deletes are
+/// reported ahead of removals when the walk found both; a walk stopped on removals may not have
+/// reached a later delete. Either way the commit is refused, and either kind invites the same answer
+/// -- re-judge the snapshots since the validation start and drop what they touched.
 async fn validate_no_conflicting_changes(
     table: &Table,
     branch: &str,
@@ -545,7 +547,9 @@ async fn validate_no_conflicting_changes(
                     }
                     _ => {}
                 }
-                if deletes.len() >= MAX_CONFLICTS_IN_MESSAGE {
+                if deletes.len() >= MAX_CONFLICTS_IN_MESSAGE
+                    || removals.len() >= MAX_CONFLICTS_IN_MESSAGE
+                {
                     break 'snapshots;
                 }
             }
@@ -694,9 +698,9 @@ mod tests {
 
     use super::{
         CONCURRENT_DELETES_PREFIX, CONCURRENT_REMOVAL_PREFIX, FIELD_ID_POSITIONAL_DELETE_FILE_PATH,
-        Overwrite, ReplaceFilesMode, ReplaceFilesOperation, Rewrite, RewriteValidationFailure,
-        delete_targets, rewrite_validation_failure, validate_no_conflicting_changes,
-        without_scheme,
+        MAX_CONFLICTS_IN_MESSAGE, Overwrite, ReplaceFilesMode, ReplaceFilesOperation, Rewrite,
+        RewriteValidationFailure, delete_targets, rewrite_validation_failure,
+        validate_no_conflicting_changes, without_scheme,
     };
     use crate::catalog::MockCatalog;
     use crate::error::Result;
@@ -1275,6 +1279,30 @@ mod tests {
             table_with_concurrent_snapshot(vec![], vec![data_file(&base, REWRITTEN_DATA_FILE)])
                 .await;
         validate(&table, CHILD_SNAPSHOT_ID, true).await.unwrap();
+    }
+
+    /// The walk stops on removals too, and the message names at most the cap.
+    #[tokio::test]
+    async fn test_removals_are_capped_like_deletes() {
+        let base = make_v2_table_with_delete_manifest().await;
+        let inputs: Vec<DataFile> = (0..7)
+            .map(|i| data_file(&base, &format!("s3://bucket/data/input-{i}.parquet")))
+            .collect();
+        let table = table_with_concurrent_snapshot(vec![], inputs.clone()).await;
+        let err =
+            validate_no_conflicting_changes(&table, MAIN_BRANCH, PARENT_SNAPSHOT_ID, &inputs, true)
+                .await
+                .expect_err("removed inputs must refuse");
+        assert_eq!(
+            rewrite_validation_failure(&err),
+            Some(RewriteValidationFailure::ConcurrentRemoval),
+            "{err}"
+        );
+        assert_eq!(
+            err.message().matches("(removed by snapshot").count(),
+            MAX_CONFLICTS_IN_MESSAGE,
+            "{err}"
+        );
     }
 
     #[tokio::test]
