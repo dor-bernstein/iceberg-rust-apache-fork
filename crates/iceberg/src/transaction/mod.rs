@@ -60,8 +60,8 @@ pub use rewrite_manifests::RewriteManifestsAction;
 pub use update_schema::UpdateSchemaAction;
 mod manifest_filter;
 mod replace_files;
-
 pub use manifest_filter::*;
+pub use replace_files::{RewriteValidationFailure, rewrite_validation_failure};
 mod remove_snapshots;
 mod rewrite_manifests;
 mod snapshot;
