@@ -371,7 +371,12 @@ impl<M: ReplaceFilesMode> ReplaceFilesAction<M> {
     }
 
     /// Validate, at commit time, that no snapshot committed to the target branch after
-    /// `snapshot_id` added a delete that applies to a data file this action removes.
+    /// `snapshot_id` added a delete that applies to a data file this action removes, or removed
+    /// one of those data files itself.
+    ///
+    /// The removal half is Java's `validateDeletedDataFiles`: another compaction or overwrite got to
+    /// the file first. [`Self::set_check_file_existence`] catches that too, but as a `DataInvalid`
+    /// that retry loops read as transient; this names it as the conflict it is.
     ///
     /// Without it a rewrite planned at `snapshot_id` silently resurrects rows: another writer
     /// commits a position delete against data file `D`, this action replaces `D` with a file
@@ -407,6 +412,10 @@ pub enum RewriteValidationFailure {
     /// file. Re-planning, or re-judging that snapshot more precisely and validating from it, can
     /// succeed.
     ConcurrentDeletes,
+    /// A snapshot after the validation start removed one of the data files this action removes
+    /// (another compaction or overwrite replaced it first). Re-planning without that file, or
+    /// dropping the plan that read it, can succeed.
+    ConcurrentRemoval,
     /// The validation start is not an ancestor of the branch head (expired, rolled back, or the
     /// branch is empty), so what happened since cannot be known. Retrying cannot help.
     UntraceableHistory,
@@ -420,6 +429,8 @@ pub fn rewrite_validation_failure(err: &Error) -> Option<RewriteValidationFailur
     }
     if err.message().starts_with(CONCURRENT_DELETES_PREFIX) {
         Some(RewriteValidationFailure::ConcurrentDeletes)
+    } else if err.message().starts_with(CONCURRENT_REMOVAL_PREFIX) {
+        Some(RewriteValidationFailure::ConcurrentRemoval)
     } else if err.message().starts_with(UNTRACEABLE_HISTORY_PREFIX) {
         Some(RewriteValidationFailure::UntraceableHistory)
     } else {
@@ -429,6 +440,8 @@ pub fn rewrite_validation_failure(err: &Error) -> Option<RewriteValidationFailur
 
 const CONCURRENT_DELETES_PREFIX: &str =
     "Cannot commit the rewrite: a delete committed after snapshot";
+const CONCURRENT_REMOVAL_PREFIX: &str =
+    "Cannot commit the rewrite: a snapshot committed after snapshot";
 const UNTRACEABLE_HISTORY_PREFIX: &str = "Cannot validate the rewrite from snapshot";
 
 /// `path` without its scheme. Writers in one table have spelled the same object `s3://` and
@@ -438,12 +451,20 @@ fn without_scheme(path: &str) -> &str {
 }
 
 /// Fail if a snapshot after `starting_snapshot_id` on `branch` added a delete that may apply to
-/// one of `removed_data_files`.
+/// one of `removed_data_files`, or removed one of them itself.
 ///
 /// Each snapshot is judged by the manifests it wrote itself (`added_snapshot_id`), read from its
-/// own manifest list, so a later manifest rewrite cannot hide the entry. Stops at the first
-/// [`MAX_CONFLICTS_IN_MESSAGE`] conflicts: one is enough to refuse.
-async fn validate_no_new_deletes_for_data_files(
+/// own manifest list, so a later manifest rewrite cannot hide the entry: an added delete is an
+/// `Added` entry in a delete manifest it wrote, and a removal is a `Deleted` entry in a data
+/// manifest it wrote -- the spec keeps `Deleted` entries only in the deleting snapshot's own
+/// manifests. Attributed by manifest, never by the entry's `snapshot_id`, which some writers
+/// (pyiceberg < 0.10 deletes, 0.11.1 overwrites) stamp with the original adding snapshot.
+///
+/// Stops once either kind reaches [`MAX_CONFLICTS_IN_MESSAGE`]: one is enough to refuse. Deletes are
+/// reported ahead of removals when the walk found both; a walk stopped on removals may not have
+/// reached a later delete. Either way the commit is refused, and either kind invites the same answer
+/// -- re-judge the snapshots since the validation start and drop what they touched.
+async fn validate_no_conflicting_changes(
     table: &Table,
     branch: &str,
     starting_snapshot_id: i64,
@@ -488,49 +509,74 @@ async fn validate_no_new_deletes_for_data_files(
         )));
     }
 
-    let mut conflicts: Vec<String> = Vec::new();
+    let mut deletes: Vec<String> = Vec::new();
+    let mut removals: Vec<String> = Vec::new();
     'snapshots: for snapshot in &newer {
         let manifest_list = snapshot
             .load_manifest_list(table.file_io(), metadata)
             .await?;
         for manifest_file in manifest_list.entries() {
-            // Not skipped on `added_files_count`: that is the writer's own claim, and a wrong 0
-            // would hide a delete from the one check that sees this window. Entry status decides.
-            if manifest_file.content != ManifestContentType::Deletes
-                || manifest_file.added_snapshot_id != snapshot.snapshot_id()
-            {
+            // Not skipped on `added_files_count` / `deleted_files_count`: those are the writer's own
+            // claims, and a wrong 0 would hide a conflict from the one check that sees this window.
+            // Entry status decides.
+            if manifest_file.added_snapshot_id != snapshot.snapshot_id() {
                 continue;
             }
             let manifest = manifest_file.load_manifest(table.file_io()).await?;
             for entry in manifest.entries() {
-                if entry.status() != ManifestStatus::Added {
-                    continue;
-                }
-                let delete_file = entry.data_file();
-                for data_file in delete_targets(delete_file, &removed, ignore_equality_deletes) {
-                    conflicts.push(format!(
-                        "{data_file} (snapshot {} added {})",
-                        snapshot.snapshot_id(),
-                        delete_file.file_path()
-                    ));
-                    if conflicts.len() >= MAX_CONFLICTS_IN_MESSAGE {
-                        break 'snapshots;
+                let file = entry.data_file();
+                match (manifest_file.content, entry.status()) {
+                    (ManifestContentType::Deletes, ManifestStatus::Added) => {
+                        for data_file in delete_targets(file, &removed, ignore_equality_deletes) {
+                            deletes.push(format!(
+                                "{data_file} (snapshot {} added {})",
+                                snapshot.snapshot_id(),
+                                file.file_path()
+                            ));
+                        }
                     }
+                    (ManifestContentType::Data, ManifestStatus::Deleted)
+                        if file.content_type() == DataContentType::Data =>
+                    {
+                        if let Some(data_file) = removed.get(without_scheme(file.file_path())) {
+                            removals.push(format!(
+                                "{data_file} (removed by snapshot {})",
+                                snapshot.snapshot_id()
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+                if deletes.len() >= MAX_CONFLICTS_IN_MESSAGE
+                    || removals.len() >= MAX_CONFLICTS_IN_MESSAGE
+                {
+                    break 'snapshots;
                 }
             }
         }
     }
 
-    if conflicts.is_empty() {
-        return Ok(());
+    if !deletes.is_empty() {
+        deletes.truncate(MAX_CONFLICTS_IN_MESSAGE);
+        return Err(Error::new(
+            ErrorKind::PreconditionFailed,
+            format!(
+                "{CONCURRENT_DELETES_PREFIX} {starting_snapshot_id} applies to data files it removes: {}",
+                deletes.join(", ")
+            ),
+        ));
     }
-    Err(Error::new(
-        ErrorKind::PreconditionFailed,
-        format!(
-            "{CONCURRENT_DELETES_PREFIX} {starting_snapshot_id} applies to data files it removes: {}",
-            conflicts.join(", ")
-        ),
-    ))
+    if !removals.is_empty() {
+        removals.truncate(MAX_CONFLICTS_IN_MESSAGE);
+        return Err(Error::new(
+            ErrorKind::PreconditionFailed,
+            format!(
+                "{CONCURRENT_REMOVAL_PREFIX} {starting_snapshot_id} already removed data files it removes: {}",
+                removals.join(", ")
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// The removed data files `delete_file` may apply to, as scheme-less paths.
@@ -609,7 +655,7 @@ impl<M: ReplaceFilesMode> TransactionAction for ReplaceFilesAction<M> {
         }
 
         if let Some(starting_snapshot_id) = self.validate_from_snapshot_id {
-            validate_no_new_deletes_for_data_files(
+            validate_no_conflicting_changes(
                 table,
                 snapshot_producer.target_branch(),
                 starting_snapshot_id,
@@ -651,9 +697,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        CONCURRENT_DELETES_PREFIX, FIELD_ID_POSITIONAL_DELETE_FILE_PATH, Overwrite,
-        ReplaceFilesMode, ReplaceFilesOperation, Rewrite, RewriteValidationFailure, delete_targets,
-        rewrite_validation_failure, validate_no_new_deletes_for_data_files, without_scheme,
+        CONCURRENT_DELETES_PREFIX, CONCURRENT_REMOVAL_PREFIX, FIELD_ID_POSITIONAL_DELETE_FILE_PATH,
+        MAX_CONFLICTS_IN_MESSAGE, Overwrite, ReplaceFilesMode, ReplaceFilesOperation, Rewrite,
+        RewriteValidationFailure, delete_targets, rewrite_validation_failure,
+        validate_no_conflicting_changes, without_scheme,
     };
     use crate::catalog::MockCatalog;
     use crate::error::Result;
@@ -862,24 +909,48 @@ mod tests {
     /// The parent's own delete files carry no bounds, so they would conflict with any removed
     /// file if the validation (wrongly) looked at snapshots at or before the starting one.
     async fn table_with_concurrent_deletes(deletes: Vec<DataFile>) -> Table {
+        table_with_concurrent_snapshot(deletes, vec![]).await
+    }
+
+    /// As [`table_with_concurrent_deletes`], where the child's own manifests also record `removed`
+    /// as `Deleted` data entries -- another compaction or overwrite replacing those files.
+    async fn table_with_concurrent_snapshot(
+        deletes: Vec<DataFile>,
+        removed: Vec<DataFile>,
+    ) -> Table {
         let base = make_v2_table_with_delete_manifest().await;
         let file_io = base.file_io().clone();
         let location = base.metadata().location().to_string();
-        let manifest_path = format!("{location}/metadata/child-delete-manifest.avro");
         let list_path = format!("{location}/metadata/child-manifest-list.avro");
+        let writer = |name: &str| {
+            ManifestWriterBuilder::new(
+                file_io
+                    .new_output(format!("{location}/metadata/{name}.avro"))
+                    .unwrap(),
+                Some(CHILD_SNAPSHOT_ID),
+                None,
+                base.metadata().current_schema().clone(),
+                base.metadata().default_partition_spec().as_ref().clone(),
+            )
+        };
 
-        let mut writer = ManifestWriterBuilder::new(
-            file_io.new_output(&manifest_path).unwrap(),
-            Some(CHILD_SNAPSHOT_ID),
-            None,
-            base.metadata().current_schema().clone(),
-            base.metadata().default_partition_spec().as_ref().clone(),
-        )
-        .build_v2_deletes();
+        let mut manifests = Vec::new();
+        let mut delete_writer = writer("child-delete-manifest").build_v2_deletes();
         for delete in deletes {
-            writer.add_file(delete, PARENT_SEQUENCE_NUMBER + 1).unwrap();
+            delete_writer
+                .add_file(delete, PARENT_SEQUENCE_NUMBER + 1)
+                .unwrap();
         }
-        let manifest = writer.write_manifest_file().await.unwrap();
+        manifests.push(delete_writer.write_manifest_file().await.unwrap());
+        if !removed.is_empty() {
+            let mut data_writer = writer("child-data-manifest").build_v2_data();
+            for file in removed {
+                data_writer
+                    .add_delete_file(file, PARENT_SEQUENCE_NUMBER, Some(PARENT_SEQUENCE_NUMBER))
+                    .unwrap();
+            }
+            manifests.push(data_writer.write_manifest_file().await.unwrap());
+        }
 
         let mut list_writer = ManifestListWriter::v2(
             file_io.new_output(&list_path).unwrap(),
@@ -887,9 +958,7 @@ mod tests {
             Some(PARENT_SNAPSHOT_ID),
             PARENT_SEQUENCE_NUMBER + 1,
         );
-        list_writer
-            .add_manifests(vec![manifest].into_iter())
-            .unwrap();
+        list_writer.add_manifests(manifests.into_iter()).unwrap();
         list_writer.close().await.unwrap();
 
         let child = Snapshot::builder()
@@ -926,7 +995,7 @@ mod tests {
     }
 
     async fn validate(table: &Table, from: i64, ignore_equality_deletes: bool) -> Result<()> {
-        validate_no_new_deletes_for_data_files(
+        validate_no_conflicting_changes(
             table,
             MAIN_BRANCH,
             from,
@@ -1162,11 +1231,138 @@ mod tests {
         validate(&table, CHILD_SNAPSHOT_ID, true).await.unwrap();
     }
 
+    fn assert_removal_conflict(result: Result<()>) {
+        let err = result.expect_err("a rewrite of an already-removed file must be refused");
+        assert_eq!(err.kind(), ErrorKind::PreconditionFailed, "{err}");
+        assert!(!err.retryable(), "a conflict must not be retried: {err}");
+        assert_eq!(
+            rewrite_validation_failure(&err),
+            Some(RewriteValidationFailure::ConcurrentRemoval),
+            "{err}"
+        );
+        assert!(
+            err.message().contains(without_scheme(REWRITTEN_DATA_FILE)),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_concurrent_removal_of_an_input_is_a_typed_conflict() {
+        let base = make_v2_table_with_delete_manifest().await;
+        let table =
+            table_with_concurrent_snapshot(vec![], vec![data_file(&base, REWRITTEN_DATA_FILE)])
+                .await;
+        assert_removal_conflict(validate(&table, PARENT_SNAPSHOT_ID, true).await);
+    }
+
+    #[tokio::test]
+    async fn test_a_concurrent_removal_of_another_file_does_not_conflict() {
+        let base = make_v2_table_with_delete_manifest().await;
+        let table =
+            table_with_concurrent_snapshot(vec![], vec![data_file(&base, OTHER_DATA_FILE)]).await;
+        validate(&table, PARENT_SNAPSHOT_ID, true).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_a_removal_spelled_with_another_scheme_still_conflicts() {
+        let base = make_v2_table_with_delete_manifest().await;
+        let s3a = REWRITTEN_DATA_FILE.replacen("s3://", "s3a://", 1);
+        let table = table_with_concurrent_snapshot(vec![], vec![data_file(&base, &s3a)]).await;
+        assert_removal_conflict(validate(&table, PARENT_SNAPSHOT_ID, true).await);
+    }
+
+    /// A removal at or before the validation start is the caller's to have judged.
+    #[tokio::test]
+    async fn test_a_removal_before_the_validation_start_is_not_looked_at() {
+        let base = make_v2_table_with_delete_manifest().await;
+        let table =
+            table_with_concurrent_snapshot(vec![], vec![data_file(&base, REWRITTEN_DATA_FILE)])
+                .await;
+        validate(&table, CHILD_SNAPSHOT_ID, true).await.unwrap();
+    }
+
+    /// The walk stops on removals too, and the message names at most the cap.
+    #[tokio::test]
+    async fn test_removals_are_capped_like_deletes() {
+        let base = make_v2_table_with_delete_manifest().await;
+        let inputs: Vec<DataFile> = (0..7)
+            .map(|i| data_file(&base, &format!("s3://bucket/data/input-{i}.parquet")))
+            .collect();
+        let table = table_with_concurrent_snapshot(vec![], inputs.clone()).await;
+        let err =
+            validate_no_conflicting_changes(&table, MAIN_BRANCH, PARENT_SNAPSHOT_ID, &inputs, true)
+                .await
+                .expect_err("removed inputs must refuse");
+        assert_eq!(
+            rewrite_validation_failure(&err),
+            Some(RewriteValidationFailure::ConcurrentRemoval),
+            "{err}"
+        );
+        assert_eq!(
+            err.message().matches("(removed by snapshot").count(),
+            MAX_CONFLICTS_IN_MESSAGE,
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deletes_are_reported_ahead_of_removals() {
+        let base = make_v2_table_with_delete_manifest().await;
+        let table = table_with_concurrent_snapshot(
+            vec![position_delete(
+                &base,
+                "s3://bucket/deletes/d1.parquet",
+                Some(REWRITTEN_DATA_FILE),
+                None,
+            )],
+            vec![data_file(&base, REWRITTEN_DATA_FILE)],
+        )
+        .await;
+        assert_conflict(validate(&table, PARENT_SNAPSHOT_ID, true).await);
+    }
+
+    /// The case `check_file_existence` used to catch alone, as a `DataInvalid` that retry loops read
+    /// as transient: the transaction is built on the planning table, another compaction removes an
+    /// input before it commits, and the rebased commit must now refuse with the typed conflict --
+    /// before `check_file_existence` runs, and without calling `update_table`.
+    #[tokio::test]
+    async fn test_a_removal_landing_before_commit_is_typed_ahead_of_the_existence_check() {
+        let planned = make_v2_table_with_delete_manifest().await;
+        let concurrent =
+            table_with_concurrent_snapshot(vec![], vec![data_file(&planned, REWRITTEN_DATA_FILE)])
+                .await;
+
+        let mut catalog = MockCatalog::new();
+        catalog.expect_load_table().returning_st(move |_| {
+            let table = concurrent.clone();
+            Box::pin(async move { Ok(table) })
+        });
+        catalog.expect_update_table().times(0);
+
+        let txn = Transaction::new(&planned);
+        let txn = txn
+            .rewrite_files()
+            .add_data_files([data_file(&planned, "s3://bucket/data/compacted.parquet")])
+            .delete_files([data_file(&planned, REWRITTEN_DATA_FILE)])
+            .set_new_data_file_sequence_number(PARENT_SEQUENCE_NUMBER)
+            .set_check_file_existence(true)
+            .validate_from_snapshot(PARENT_SNAPSHOT_ID)
+            .apply(txn)
+            .unwrap();
+
+        assert_removal_conflict(txn.commit(&catalog).await.map(|_| ()));
+    }
+
     #[test]
     fn test_other_errors_are_not_rewrite_validation_failures() {
         for err in [
             Error::new(ErrorKind::PreconditionFailed, "No added data files found"),
             Error::new(ErrorKind::DataInvalid, CONCURRENT_DELETES_PREFIX),
+            Error::new(ErrorKind::DataInvalid, CONCURRENT_REMOVAL_PREFIX),
+            Error::new(
+                ErrorKind::DataInvalid,
+                "Cannot delete files that are not in the current snapshot, files: x",
+            ),
             Error::new(ErrorKind::CatalogCommitConflicts, "Commit conflict"),
         ] {
             assert_eq!(rewrite_validation_failure(&err), None, "{err}");
