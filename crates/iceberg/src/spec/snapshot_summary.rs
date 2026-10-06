@@ -349,6 +349,13 @@ impl LiveFileTotals {
             .additional_properties
             .extend(totals_equal_to_added(&self.0.to_map()));
     }
+
+    /// Removes all six totals from `summary`, for when they could not be counted.
+    pub(crate) fn remove_from(summary: &mut Summary) {
+        for (total, _, _) in TOTALS {
+            summary.additional_properties.remove(total);
+        }
+    }
 }
 
 fn set_if_positive<T>(properties: &mut HashMap<String, String>, value: T, property_name: &str)
@@ -659,6 +666,25 @@ mod tests {
         assert_eq!(props.get(TOTAL_RECORDS).unwrap(), "47982787");
         assert_eq!(props.get(TOTAL_DATA_FILES).unwrap(), "23");
         assert_eq!(props.get(TOTAL_DELETE_FILES).unwrap(), "0");
+    }
+
+    /// When a recount fails the totals go, including a small one rolled forward
+    /// from a fabricated parent; the rest of the summary stays.
+    #[test]
+    fn test_live_file_totals_remove_from_drops_only_totals() {
+        let mut rewrite = summary(Operation::Replace, &[
+            (ADDED_FILE_SIZE, "777"),
+            (TOTAL_FILE_SIZE, "529306"),
+            (TOTAL_RECORDS, "47982787"),
+            (TOTAL_DATA_FILES, "23"),
+        ]);
+
+        LiveFileTotals::remove_from(&mut rewrite);
+
+        assert_eq!(
+            rewrite.additional_properties,
+            HashMap::from([(ADDED_FILE_SIZE.to_string(), "777".to_string())])
+        );
     }
 
     /// A table's first snapshot has no previous total to be missing: it starts

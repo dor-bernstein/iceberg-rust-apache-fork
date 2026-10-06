@@ -749,8 +749,10 @@ partition_struct: {:?}, partition_type: {:?}",
     /// [`SnapshotProduceOperation::recounts_totals`] is set, the commits maintenance makes
     /// regularly, so the totals are re-based on the files there.
     ///
-    /// Best effort: if a manifest cannot be read, the rolled-forward totals stand. A summary is
-    /// advisory and must not fail the commit.
+    /// Best effort: a summary is advisory and must not fail the commit. If a manifest cannot be
+    /// read, the totals are dropped rather than rolled forward, because the parent's may be the
+    /// small fabricated ones this exists to repair, and an absent total is safe where a small
+    /// wrong one is not.
     async fn recompute_totals(&self, summary: &mut Summary, manifests: &[ManifestFile]) {
         let mut totals = LiveFileTotals::default();
         let counted = for_each_manifest(
@@ -762,11 +764,14 @@ partition_struct: {:?}, partition_type: {:?}",
         .await;
         match counted {
             Ok(()) => totals.apply_to(summary),
-            Err(err) => tracing::warn!(
-                snapshot_id = self.snapshot_id,
-                error = %err,
-                "could not recount snapshot totals from manifests; keeping rolled-forward totals",
-            ),
+            Err(err) => {
+                tracing::warn!(
+                    snapshot_id = self.snapshot_id,
+                    error = %err,
+                    "could not recount snapshot totals from manifests; leaving them out",
+                );
+                LiveFileTotals::remove_from(summary);
+            }
         }
     }
 
