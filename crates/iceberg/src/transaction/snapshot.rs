@@ -92,6 +92,13 @@ pub(crate) trait SnapshotProduceOperation: Send + Sync {
         &self,
         snapshot_produce: &mut SnapshotProducer<'_>,
     ) -> impl Future<Output = Result<Vec<ManifestFile>>> + Send;
+
+    /// Whether the new snapshot's `total-*` values are counted from its manifests instead of
+    /// rolled forward from the parent's summary. Counting reads every manifest of the snapshot, so
+    /// an operation opts in only where repairing drifted or missing totals is worth that.
+    fn recounts_totals(&self) -> bool {
+        false
+    }
 }
 
 pub(crate) struct DefaultManifestProcess;
@@ -628,7 +635,8 @@ partition_struct: {:?}, partition_type: {:?}",
             .await
     }
 
-    // Returns a `Summary` of the current snapshot
+    // Returns a `Summary` of the current snapshot. Its `total-*` values are rolled forward from the
+    // parent; `commit` replaces them with counted ones when the operation recounts totals.
     fn summary<OP: SnapshotProduceOperation>(
         &self,
         snapshot_produce_operation: &OP,
@@ -737,8 +745,9 @@ partition_struct: {:?}, partition_type: {:?}",
     ///
     /// Rolling forward carries the parent's errors into every later snapshot: DuckDB writes no
     /// file-size totals and Iceberg's delete counters drift, so a table can report 0 bytes while
-    /// holding a billion rows. A replace leaves the table's rows unchanged and is the commit that
-    /// maintenance makes regularly, so it is where the totals are re-based on the files.
+    /// holding a billion rows. Runs for operations whose
+    /// [`SnapshotProduceOperation::recounts_totals`] is set, the commits maintenance makes
+    /// regularly, so the totals are re-based on the files there.
     ///
     /// Best effort: if a manifest cannot be read, the rolled-forward totals stand. A summary is
     /// advisory and must not fail the commit.
@@ -826,7 +835,7 @@ partition_struct: {:?}, partition_type: {:?}",
         let new_manifests = self
             .manifest_file(&snapshot_produce_operation, &process)
             .await?;
-        if summary.operation == Operation::Replace {
+        if snapshot_produce_operation.recounts_totals() {
             self.recompute_totals(&mut summary, &new_manifests).await;
         }
         manifest_list_writer.add_manifests(new_manifests.into_iter())?;

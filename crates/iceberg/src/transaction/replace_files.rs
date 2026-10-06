@@ -82,6 +82,13 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
         M::OPERATION
     }
 
+    /// A rewrite is what compaction commits, and it already reads the parent's manifests, so it
+    /// is where missing or drifted totals get repaired. An overwrite keeps the truncate semantics
+    /// of `update_snapshot_summaries`.
+    fn recounts_totals(&self) -> bool {
+        M::OPERATION == Operation::Replace
+    }
+
     async fn delete_entries(
         &self,
         snapshot_produce: &SnapshotProducer<'_>,
@@ -846,13 +853,17 @@ mod tests {
     const OTHER_DATA_FILE: &str = "s3://bucket/data/z-other.parquet";
 
     fn data_file(table: &Table, path: &str) -> DataFile {
+        sized_data_file(table, path, 100, 10)
+    }
+
+    fn sized_data_file(table: &Table, path: &str, size: u64, records: u64) -> DataFile {
         DataFileBuilder::default()
             .partition_spec_id(table.metadata().default_partition_spec_id())
             .content(DataContentType::Data)
             .file_path(path.to_string())
             .file_format(DataFileFormat::Parquet)
-            .file_size_in_bytes(100)
-            .record_count(10)
+            .file_size_in_bytes(size)
+            .record_count(records)
             .partition(Struct::from_iter([Some(Literal::long(300))]))
             .build()
             .unwrap()
@@ -961,17 +972,22 @@ mod tests {
         list_writer.add_manifests(manifests.into_iter()).unwrap();
         list_writer.close().await.unwrap();
 
+        with_head_snapshot(base, &list_path, Summary {
+            operation: Operation::Overwrite,
+            additional_properties: HashMap::new(),
+        })
+    }
+
+    /// `base` with [`CHILD_SNAPSHOT_ID`], a child of [`PARENT_SNAPSHOT_ID`], as `main`.
+    fn with_head_snapshot(base: Table, manifest_list: &str, summary: Summary) -> Table {
         let child = Snapshot::builder()
             .with_snapshot_id(CHILD_SNAPSHOT_ID)
             .with_parent_snapshot_id(Some(PARENT_SNAPSHOT_ID))
             .with_timestamp_ms(base.metadata().last_updated_ms() + 2)
             .with_sequence_number(PARENT_SEQUENCE_NUMBER + 1)
             .with_schema_id(0)
-            .with_manifest_list(list_path)
-            .with_summary(Summary {
-                operation: Operation::Overwrite,
-                additional_properties: HashMap::new(),
-            })
+            .with_manifest_list(manifest_list)
+            .with_summary(summary)
             .build();
         let metadata = base
             .metadata()
@@ -1381,56 +1397,25 @@ mod tests {
     /// The fixture's `main` with its summary replaced by `summary`, on the same manifest list.
     async fn table_whose_head_summary_is(summary: &[(&str, &str)]) -> Table {
         let base = make_v2_table_with_delete_manifest().await;
-        let parent = base.metadata().current_snapshot().unwrap();
-        let head = Snapshot::builder()
-            .with_snapshot_id(CHILD_SNAPSHOT_ID)
-            .with_parent_snapshot_id(Some(PARENT_SNAPSHOT_ID))
-            .with_timestamp_ms(base.metadata().last_updated_ms() + 2)
-            .with_sequence_number(PARENT_SEQUENCE_NUMBER + 1)
-            .with_schema_id(0)
-            .with_manifest_list(parent.manifest_list())
-            .with_summary(Summary {
-                operation: Operation::Append,
-                additional_properties: summary
-                    .iter()
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-                    .collect(),
-            })
-            .build();
-        let metadata = base
+        let manifest_list = base
             .metadata()
-            .clone()
-            .into_builder(Some("s3://bucket/test/location/metadata/v2.json".into()))
-            .add_snapshot(head)
+            .current_snapshot()
             .unwrap()
-            .set_ref(MAIN_BRANCH, SnapshotReference {
-                snapshot_id: CHILD_SNAPSHOT_ID,
-                retention: SnapshotRetention::Branch {
-                    min_snapshots_to_keep: None,
-                    max_snapshot_age_ms: None,
-                    max_ref_age_ms: None,
-                },
-            })
-            .unwrap()
-            .build()
-            .unwrap()
-            .metadata;
-        base.with_metadata(Arc::new(metadata))
+            .manifest_list()
+            .to_string();
+        with_head_snapshot(base, &manifest_list, Summary {
+            operation: Operation::Append,
+            additional_properties: summary
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        })
     }
 
     /// Commits a rewrite of `table` that adds one 777-byte, 13-row data file and removes
     /// [`REMOVED_DELETE_FILE`], and returns the new snapshot's summary.
     async fn rewrite_summary(table: &Table) -> HashMap<String, String> {
-        let compacted = DataFileBuilder::default()
-            .partition_spec_id(table.metadata().default_partition_spec_id())
-            .content(DataContentType::Data)
-            .file_path("s3://bucket/data/compacted.parquet".to_string())
-            .file_format(DataFileFormat::Parquet)
-            .file_size_in_bytes(777)
-            .record_count(13)
-            .partition(Struct::from_iter([Some(Literal::long(300))]))
-            .build()
-            .unwrap();
+        let compacted = sized_data_file(table, "s3://bucket/data/compacted.parquet", 777, 13);
         let action = Transaction::new(table)
             .rewrite_files()
             .add_data_files([compacted])

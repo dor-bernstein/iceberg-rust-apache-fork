@@ -337,19 +337,10 @@ impl LiveFileTotals {
 
     /// Writes all six totals into `summary`, zeros included, replacing whatever was there.
     pub(crate) fn apply_to(&self, summary: &mut Summary) {
-        let metrics = &self.0;
-        for (property, value) in [
-            (TOTAL_DATA_FILES, u64::from(metrics.added_data_files)),
-            (TOTAL_DELETE_FILES, u64::from(metrics.added_delete_files)),
-            (TOTAL_RECORDS, metrics.added_records),
-            (TOTAL_FILE_SIZE, metrics.added_file_size),
-            (TOTAL_POSITION_DELETES, metrics.added_pos_deletes),
-            (TOTAL_EQUALITY_DELETES, metrics.added_eq_deletes),
-        ] {
-            summary
-                .additional_properties
-                .insert(property.to_string(), value.to_string());
-        }
+        // Every live file was counted as added, so each total is its `added-*` counterpart.
+        summary
+            .additional_properties
+            .extend(totals_equal_to_added(&self.0.to_map()));
     }
 }
 
@@ -362,7 +353,7 @@ where T: PartialOrd + Default + ToString {
 
 #[allow(dead_code)]
 pub(crate) fn update_snapshot_summaries(
-    summary: Summary,
+    mut summary: Summary,
     previous_summary: Option<&Summary>,
     truncate_full_table: bool,
 ) -> Result<Summary> {
@@ -380,19 +371,9 @@ pub(crate) fn update_snapshot_summaries(
 
     match previous_summary {
         Some(prev_summary) if truncate_full_table && summary.operation == Operation::Overwrite => {
-            let mut summary = truncate_table_summary(summary, prev_summary);
-            // Every earlier file is gone, so each total is exactly what this snapshot added,
-            // whatever the previous summary held.
-            for (total_property, added_property, _) in TOTALS {
-                let added = parse_or_zero(summary.additional_properties.get(added_property));
-                summary
-                    .additional_properties
-                    .insert(total_property.to_string(), added.to_string());
-            }
-            Ok(summary)
+            Ok(truncate_table_summary(summary, prev_summary))
         }
         _ => {
-            let mut summary = summary;
             for (total_property, added_property, removed_property) in TOTALS {
                 update_totals(
                     &mut summary,
@@ -425,57 +406,37 @@ const TOTALS: [(&str, &str, &str); 6] = [
     ),
 ];
 
-fn parse_or_zero(value: Option<&String>) -> u64 {
-    value.and_then(|v| v.parse::<u64>().ok()).unwrap_or(0)
+/// A summary value as a `u64`. Any engine may write these, so a malformed, empty or overflowing
+/// value must not panic the writer: it reads as `None`.
+fn parse_u64(value: Option<&String>) -> Option<u64> {
+    value?.parse().ok()
 }
 
-/// Read a `total_*` property from a previous summary as a `u64`.
-///
-/// Snapshot summary values are decimal strings inside a
-/// `HashMap<String, String>` and may be written by any Iceberg engine
-/// (Java, Python, Rust, ...). A malformed entry, an empty string, or a
-/// value exceeding `u64::MAX` must not panic the writer — we treat any
-/// unparsable value as `0`, matching the policy in `update_totals`.
-#[allow(dead_code)]
-fn previous_total_or_zero(previous_summary: &Summary, prop: &str) -> u64 {
-    previous_summary
-        .additional_properties
-        .get(prop)
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0)
+/// Every `total-*` set to its `added-*` counterpart in `properties`, an absent one counting as 0.
+fn totals_equal_to_added(properties: &HashMap<String, String>) -> Vec<(String, String)> {
+    TOTALS
+        .iter()
+        .map(|(total, added, _)| {
+            let value = parse_u64(properties.get(*added)).unwrap_or(0);
+            (total.to_string(), value.to_string())
+        })
+        .collect()
 }
 
+/// A full-table overwrite: every earlier file is gone, so each `removed-*` is the previous total
+/// (when it can be read) and each total is exactly what this snapshot added.
 #[allow(dead_code)]
 fn truncate_table_summary(mut summary: Summary, previous_summary: &Summary) -> Summary {
-    for prop in [
-        TOTAL_DATA_FILES,
-        TOTAL_DELETE_FILES,
-        TOTAL_RECORDS,
-        TOTAL_FILE_SIZE,
-        TOTAL_POSITION_DELETES,
-        TOTAL_EQUALITY_DELETES,
-    ] {
-        summary
-            .additional_properties
-            .insert(prop.to_string(), "0".to_string());
-    }
-
-    for (total_prop, removed_prop) in [
-        (TOTAL_DATA_FILES, DELETED_DATA_FILES),
-        (TOTAL_DELETE_FILES, REMOVED_DELETE_FILES),
-        (TOTAL_RECORDS, DELETED_RECORDS),
-        (TOTAL_FILE_SIZE, REMOVED_FILE_SIZE),
-        (TOTAL_POSITION_DELETES, REMOVED_POSITION_DELETES),
-        (TOTAL_EQUALITY_DELETES, REMOVED_EQUALITY_DELETES),
-    ] {
-        let value = previous_total_or_zero(previous_summary, total_prop);
+    for (total_prop, _, removed_prop) in TOTALS {
+        let value = parse_u64(previous_summary.additional_properties.get(total_prop)).unwrap_or(0);
         if value != 0 {
             summary
                 .additional_properties
                 .insert(removed_prop.to_string(), value.to_string());
         }
     }
-
+    let totals = totals_equal_to_added(&summary.additional_properties);
+    summary.additional_properties.extend(totals);
     summary
 }
 
@@ -487,35 +448,45 @@ fn update_totals(
     added_property: &str,
     removed_property: &str,
 ) {
-    // Summary values are decimal strings that any engine may write, or leave out: DuckDB omits
-    // the file-size totals entirely. A total rolled forward from a previous value that is missing
-    // or unparsable is unknown, not zero; writing `added - removed` in its place publishes a
-    // confident wrong number, which planners read as table size. So, as Java's
+    // A total rolled forward from a previous value that is missing or unparsable is unknown, not
+    // zero: DuckDB omits the file-size totals entirely, and writing `added - removed` in their
+    // place publishes a confident wrong number that planners read as table size. So, as Java's
     // `SnapshotProducer.updateTotal` does, the total is left out when the previous one cannot be
     // read or the result would be negative. Only a table's first snapshot starts from zero.
     let previous_total = match previous_summary {
         None => Some(0),
-        Some(previous_summary) => previous_summary
-            .additional_properties
-            .get(total_property)
-            .and_then(|v| v.parse::<u64>().ok()),
+        Some(previous_summary) => {
+            parse_u64(previous_summary.additional_properties.get(total_property))
+        }
     };
-    let delta = |property: &str| match summary.additional_properties.get(property) {
-        None => Some(0),
-        Some(value) => value.parse::<u64>().ok(),
-    };
-
-    let new_total = previous_total
-        .zip(delta(added_property))
-        .and_then(|(previous, added)| previous.checked_add(added))
-        .zip(delta(removed_property))
-        .and_then(|(total, removed)| total.checked_sub(removed));
-
+    let new_total = rolled_total(
+        previous_total,
+        &summary.additional_properties,
+        added_property,
+        removed_property,
+    );
     if let Some(total) = new_total {
         summary
             .additional_properties
             .insert(total_property.to_string(), total.to_string());
     }
+}
+
+/// `previous + added - removed`, or `None` if any part is unreadable or the result is negative.
+/// An absent delta counts as 0.
+fn rolled_total(
+    previous: Option<u64>,
+    properties: &HashMap<String, String>,
+    added_property: &str,
+    removed_property: &str,
+) -> Option<u64> {
+    let delta = |property: &str| match properties.get(property) {
+        None => Some(0),
+        value => parse_u64(value),
+    };
+    previous?
+        .checked_add(delta(added_property)?)?
+        .checked_sub(delta(removed_property)?)
 }
 
 #[cfg(test)]
@@ -634,42 +605,40 @@ mod tests {
         assert!(!updated.additional_properties.contains_key(TOTAL_FILE_SIZE));
     }
 
+    fn summary(operation: Operation, properties: &[(&str, &str)]) -> Summary {
+        Summary {
+            operation,
+            additional_properties: properties
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
     /// The production case: DuckDB 1.5's native writes keep the count totals
     /// but write no file-size keys at all. A rewrite after one used to publish
     /// `added - removed` as the table's size (0.5 MB for a 48M-row table, 0 for
     /// 1.46B rows), which Spark then planned as broadcastable.
     #[test]
     fn test_update_totals_omits_size_after_a_parent_without_size_totals() {
-        let duckdb_append = Summary {
-            operation: Operation::Append,
-            additional_properties: [
-                (ADDED_DATA_FILES, "2"),
-                (ADDED_RECORDS, "114179"),
-                (DELETED_DATA_FILES, "0"),
-                (DELETED_RECORDS, "0"),
-                (TOTAL_DATA_FILES, "30"),
-                (TOTAL_DELETE_FILES, "0"),
-                (TOTAL_POSITION_DELETES, "0"),
-                (TOTAL_RECORDS, "47982787"),
-            ]
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect(),
-        };
-        let rewrite = Summary {
-            operation: Operation::Replace,
-            additional_properties: [
-                (ADDED_DATA_FILES, "1"),
-                (DELETED_DATA_FILES, "8"),
-                (ADDED_RECORDS, "522620"),
-                (DELETED_RECORDS, "522620"),
-                (ADDED_FILE_SIZE, "68617442"),
-                (REMOVED_FILE_SIZE, "68122332"),
-            ]
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect(),
-        };
+        let duckdb_append = summary(Operation::Append, &[
+            (ADDED_DATA_FILES, "2"),
+            (ADDED_RECORDS, "114179"),
+            (DELETED_DATA_FILES, "0"),
+            (DELETED_RECORDS, "0"),
+            (TOTAL_DATA_FILES, "30"),
+            (TOTAL_DELETE_FILES, "0"),
+            (TOTAL_POSITION_DELETES, "0"),
+            (TOTAL_RECORDS, "47982787"),
+        ]);
+        let rewrite = summary(Operation::Replace, &[
+            (ADDED_DATA_FILES, "1"),
+            (DELETED_DATA_FILES, "8"),
+            (ADDED_RECORDS, "522620"),
+            (DELETED_RECORDS, "522620"),
+            (ADDED_FILE_SIZE, "68617442"),
+            (REMOVED_FILE_SIZE, "68122332"),
+        ]);
 
         let updated = update_snapshot_summaries(rewrite, Some(&duckdb_append), false).unwrap();
         let props = &updated.additional_properties;
@@ -689,15 +658,12 @@ mod tests {
     /// from zero.
     #[test]
     fn test_update_totals_start_from_zero_without_a_previous_snapshot() {
-        let summary = Summary {
-            operation: Operation::Append,
-            additional_properties: [(ADDED_RECORDS, "7"), (ADDED_FILE_SIZE, "70")]
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-        };
+        let first = summary(Operation::Append, &[
+            (ADDED_RECORDS, "7"),
+            (ADDED_FILE_SIZE, "70"),
+        ]);
 
-        let updated = update_snapshot_summaries(summary, None, false).unwrap();
+        let updated = update_snapshot_summaries(first, None, false).unwrap();
         let props = &updated.additional_properties;
 
         assert_eq!(props.get(TOTAL_RECORDS).unwrap(), "7");
