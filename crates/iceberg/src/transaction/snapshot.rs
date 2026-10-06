@@ -690,30 +690,27 @@ partition_struct: {:?}, partition_type: {:?}",
         // — REPLACE commits look like pure appends to consumers that read
         // snapshot summaries.
         //
-        // Skipped for `Overwrite`: `update_snapshot_summaries` routes those
-        // through `truncate_table_summary`, which derives removed-* fields
-        // directly from the parent's total-* values (full-table truncate
-        // semantics). Pre-populating removed-* here would either be silently
-        // clobbered by truncate (when the parent totals are non-zero) or leak
-        // through and double-count against already-zeroed parent totals (when
-        // the parent was itself produced by a truncating overwrite), which
-        // causes `update_totals` to underflow on `previous_total - removed`.
+        // `Overwrite` is counted the same way. Its only producer,
+        // `overwrite_files`, replaces named files and carries every other
+        // manifest forward, so it is not a full-table truncate: summarising it
+        // as one reported the untouched files as removed and the table as
+        // holding only this commit's files. A parent whose totals are already
+        // inconsistent cannot underflow here any more; `update_totals` leaves
+        // a negative total out.
         let operation = snapshot_produce_operation.operation();
-        if operation != Operation::Overwrite {
-            for data_file in &self.removed_data_files {
-                summary_collector.remove_file(
-                    data_file,
-                    table_metadata.current_schema().clone(),
-                    table_metadata.default_partition_spec().clone(),
-                );
-            }
-            for delete_file in &self.removed_delete_files {
-                summary_collector.remove_file(
-                    delete_file,
-                    table_metadata.current_schema().clone(),
-                    table_metadata.default_partition_spec().clone(),
-                );
-            }
+        for data_file in &self.removed_data_files {
+            summary_collector.remove_file(
+                data_file,
+                table_metadata.current_schema().clone(),
+                table_metadata.default_partition_spec().clone(),
+            );
+        }
+        for delete_file in &self.removed_delete_files {
+            summary_collector.remove_file(
+                delete_file,
+                table_metadata.current_schema().clone(),
+                table_metadata.default_partition_spec().clone(),
+            );
         }
 
         // The previous snapshot for summary rollup is the current tip of the
@@ -733,11 +730,7 @@ partition_struct: {:?}, partition_type: {:?}",
             additional_properties,
         };
 
-        update_snapshot_summaries(
-            summary,
-            previous_snapshot.map(|s| s.summary()),
-            operation == Operation::Overwrite,
-        )
+        update_snapshot_summaries(summary, previous_snapshot.map(|s| s.summary()), false)
     }
 
     /// Replaces the summary's rolled-forward `total-*` values with ones counted from `manifests`,
@@ -1599,25 +1592,19 @@ mod tests {
         );
     }
 
-    /// Regression test: on an `Overwrite` commit whose parent is itself a
-    /// truncating overwrite (so the parent's `total-*` rolled down to 0),
-    /// `summary()` must not feed removed_data_files through the summary
-    /// collector. `update_snapshot_summaries` routes Overwrite through
-    /// `truncate_table_summary`, which derives removed-* fields from the
-    /// parent's total-* values. When the parent totals are zero the truncate
-    /// step leaves the summary unchanged, so any removed-* that `summary()`
-    /// pre-populated leaks into `update_totals` and computes
+    /// Regression test: an `Overwrite` that removes a file from a parent whose
+    /// `total-*` already read 0 computes
     ///   new_total = previous_total(0) + added(0) - removed(>0)
-    /// which underflows on u64 and panics with "attempt to subtract with
-    /// overflow".
+    /// which once underflowed on u64 and panicked with "attempt to subtract
+    /// with overflow".
     ///
     /// This mirrors the shape that the existing
     /// overwrite_files_test::test_partition_spec_id_in_manifest integration
     /// test exercises: N fast appends followed by N single-file
-    /// overwrite-deletes in separate commits. Before this fix the second
-    /// overwrite-delete panics; with the fix `summary()` skips the
-    /// remove_file calls for Overwrite and `truncate_table_summary` drives
-    /// the accounting as it always has.
+    /// overwrite-deletes in separate commits. The parent's totals contradict
+    /// its files, so the new ones cannot be rolled forward and are left out
+    /// (a committed overwrite then recounts them from its manifests), while
+    /// the removal itself is still reported.
     #[tokio::test]
     async fn test_overwrite_summary_does_not_underflow_after_prior_truncate() {
         // Build a parent whose `total-*` are all zero — i.e. the prior
@@ -1691,19 +1678,19 @@ mod tests {
         );
 
         // The key assertion is that this does not panic with
-        // "attempt to subtract with overflow". The returned summary is
-        // allowed to report zeros across the board — that matches what the
-        // JVM Iceberg reference produces for a no-op overwrite on an empty
-        // (post-truncate) table.
+        // "attempt to subtract with overflow".
         let summary = producer
             .summary(&ReplaceFilesOperation::<Overwrite>::new())
             .unwrap();
         assert_eq!(summary.operation, Operation::Overwrite);
         let props = &summary.additional_properties;
-        assert_eq!(props.get(TOTAL_RECORDS_KEY).map(String::as_str), Some("0"));
+        assert_eq!(props.get(TOTAL_RECORDS_KEY), None);
+        assert_eq!(props.get(TOTAL_DATA_FILES_KEY), None);
+        assert_eq!(props.get("total-files-size"), None);
+        assert_eq!(props.get("deleted-records").map(String::as_str), Some("4"));
         assert_eq!(
-            props.get(TOTAL_DATA_FILES_KEY).map(String::as_str),
-            Some("0")
+            props.get("deleted-data-files").map(String::as_str),
+            Some("1")
         );
     }
 }

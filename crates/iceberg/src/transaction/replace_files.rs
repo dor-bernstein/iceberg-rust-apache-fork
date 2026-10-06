@@ -82,11 +82,10 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
         M::OPERATION
     }
 
-    /// A rewrite is what compaction commits, and it already reads the parent's manifests, so it
-    /// is where missing or drifted totals get repaired. An overwrite keeps the truncate semantics
-    /// of `update_snapshot_summaries`.
+    /// Both modes already read the parent's manifests, and a rewrite is what compaction commits,
+    /// so this is where missing or drifted totals get repaired.
     fn recounts_totals(&self) -> bool {
-        M::OPERATION == Operation::Replace
+        true
     }
 
     async fn delete_entries(
@@ -705,9 +704,9 @@ mod tests {
 
     use super::{
         CONCURRENT_DELETES_PREFIX, CONCURRENT_REMOVAL_PREFIX, FIELD_ID_POSITIONAL_DELETE_FILE_PATH,
-        MAX_CONFLICTS_IN_MESSAGE, Overwrite, ReplaceFilesMode, ReplaceFilesOperation, Rewrite,
-        RewriteValidationFailure, delete_targets, rewrite_validation_failure,
-        validate_no_conflicting_changes, without_scheme,
+        MAX_CONFLICTS_IN_MESSAGE, Overwrite, ReplaceFilesAction, ReplaceFilesMode,
+        ReplaceFilesOperation, Rewrite, RewriteValidationFailure, delete_targets,
+        rewrite_validation_failure, validate_no_conflicting_changes, without_scheme,
     };
     use crate::catalog::MockCatalog;
     use crate::error::Result;
@@ -1415,9 +1414,16 @@ mod tests {
     /// Commits a rewrite of `table` that adds one 777-byte, 13-row data file and removes
     /// `removed`, and returns the new snapshot's summary.
     async fn rewrite_summary(table: &Table, removed: DataFile) -> HashMap<String, String> {
+        replace_summary::<Rewrite>(table, removed).await
+    }
+
+    /// As [`rewrite_summary`], committed in mode `M`.
+    async fn replace_summary<M: ReplaceFilesMode>(
+        table: &Table,
+        removed: DataFile,
+    ) -> HashMap<String, String> {
         let compacted = sized_data_file(table, "s3://bucket/data/compacted.parquet", 777, 13);
-        let action = Transaction::new(table)
-            .rewrite_files()
+        let action = ReplaceFilesAction::<M>::new()
             .add_data_files([compacted])
             .delete_files([removed]);
 
@@ -1568,13 +1574,42 @@ mod tests {
         let table = table_with_data_manifest().await;
 
         let removed = data_file(&table, REWRITTEN_DATA_FILE);
-        assert_totals(&rewrite_summary(&table, removed).await, [
-            ("total-data-files", "2"),
-            ("total-records", "33"),
-            ("total-delete-files", "2"),
-            ("total-position-deletes", "2"),
-            ("total-equality-deletes", "0"),
-            ("total-files-size", "1177"),
-        ]);
+        assert_totals(
+            &rewrite_summary(&table, removed).await,
+            KEPT_COMPACTED_AND_DELETES,
+        );
+    }
+
+    /// [`table_with_data_manifest`] after replacing [`REWRITTEN_DATA_FILE`] with the compacted
+    /// file: it, [`KEPT_DATA_FILE`] and both position deletes.
+    const KEPT_COMPACTED_AND_DELETES: [(&str, &str); 6] = [
+        ("total-data-files", "2"),
+        ("total-records", "33"),
+        ("total-delete-files", "2"),
+        ("total-position-deletes", "2"),
+        ("total-equality-deletes", "0"),
+        ("total-files-size", "1177"),
+    ];
+
+    /// `overwrite_files` replaces named files and keeps the rest, so its totals are the table's,
+    /// and its removed counters name only the file it replaced. It used to be summarised as a
+    /// full-table truncate: totals of just the compacted file, everything else "removed".
+    #[tokio::test]
+    async fn test_overwrite_counts_the_files_it_kept() {
+        let table = table_with_data_manifest().await;
+
+        let removed = data_file(&table, REWRITTEN_DATA_FILE);
+        let summary = replace_summary::<Overwrite>(&table, removed).await;
+
+        assert_totals(&summary, KEPT_COMPACTED_AND_DELETES);
+        assert_eq!(
+            summary.get("deleted-data-files").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            summary.get("deleted-records").map(String::as_str),
+            Some("10")
+        );
+        assert_eq!(summary.get("removed-delete-files"), None);
     }
 }
