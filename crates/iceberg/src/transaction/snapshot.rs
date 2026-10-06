@@ -1607,10 +1607,8 @@ mod tests {
     /// the removal itself is still reported.
     #[tokio::test]
     async fn test_overwrite_summary_does_not_underflow_after_prior_truncate() {
-        // Build a parent whose `total-*` are all zero — i.e. the prior
-        // commit was a full-table overwrite that already drained the totals.
-        // This is the precondition for the underflow on the next overwrite
-        // that still reports per-file removed-* values.
+        // Build a parent whose `total-*` are all zero while a file it holds is
+        // about to be removed: its totals contradict its files.
         const PARENT_SNAPSHOT_ID: i64 = 42;
         const RECORDS_PER_FILE: u64 = 4;
 

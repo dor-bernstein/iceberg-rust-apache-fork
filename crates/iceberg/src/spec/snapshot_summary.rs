@@ -217,22 +217,30 @@ impl UpdateMetrics {
         }
     }
 
+    // Saturating for the same reason as `add_file`: the removed files' sizes and counts come from
+    // manifests that any engine may have written.
     fn remove_file(&mut self, data_file: &DataFile) {
-        self.removed_file_size += data_file.file_size_in_bytes;
+        self.removed_file_size = self
+            .removed_file_size
+            .saturating_add(data_file.file_size_in_bytes);
         match data_file.content_type() {
             DataContentType::Data => {
-                self.removed_data_files += 1;
-                self.deleted_records += data_file.record_count;
+                self.removed_data_files = self.removed_data_files.saturating_add(1);
+                self.deleted_records = self.deleted_records.saturating_add(data_file.record_count);
             }
             DataContentType::PositionDeletes => {
-                self.removed_delete_files += 1;
-                self.removed_pos_delete_files += 1;
-                self.removed_pos_deletes += data_file.record_count;
+                self.removed_delete_files = self.removed_delete_files.saturating_add(1);
+                self.removed_pos_delete_files = self.removed_pos_delete_files.saturating_add(1);
+                self.removed_pos_deletes = self
+                    .removed_pos_deletes
+                    .saturating_add(data_file.record_count);
             }
             DataContentType::EqualityDeletes => {
-                self.removed_delete_files += 1;
-                self.removed_eq_delete_files += 1;
-                self.removed_eq_deletes += data_file.record_count;
+                self.removed_delete_files = self.removed_delete_files.saturating_add(1);
+                self.removed_eq_delete_files = self.removed_eq_delete_files.saturating_add(1);
+                self.removed_eq_deletes = self
+                    .removed_eq_deletes
+                    .saturating_add(data_file.record_count);
             }
         }
     }

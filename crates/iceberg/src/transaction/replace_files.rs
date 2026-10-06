@@ -1610,6 +1610,10 @@ mod tests {
             summary.get("deleted-records").map(String::as_str),
             Some("10")
         );
+        assert_eq!(
+            summary.get("removed-files-size").map(String::as_str),
+            Some("100")
+        );
         assert_eq!(summary.get("removed-delete-files"), None);
     }
 }
