@@ -1413,13 +1413,13 @@ mod tests {
     }
 
     /// Commits a rewrite of `table` that adds one 777-byte, 13-row data file and removes
-    /// [`REMOVED_DELETE_FILE`], and returns the new snapshot's summary.
-    async fn rewrite_summary(table: &Table) -> HashMap<String, String> {
+    /// `removed`, and returns the new snapshot's summary.
+    async fn rewrite_summary(table: &Table, removed: DataFile) -> HashMap<String, String> {
         let compacted = sized_data_file(table, "s3://bucket/data/compacted.parquet", 777, 13);
         let action = Transaction::new(table)
             .rewrite_files()
             .add_data_files([compacted])
-            .delete_files([position_delete_file(table, REMOVED_DELETE_FILE)]);
+            .delete_files([removed]);
 
         let mut commit = Arc::new(action).commit(table).await.unwrap();
         match commit.take_updates().into_iter().next() {
@@ -1430,17 +1430,19 @@ mod tests {
         }
     }
 
-    /// What the table holds after [`rewrite_summary`]: the compacted file plus
-    /// [`RETAINED_DELETE_FILE`] (100 bytes, one position delete).
-    fn assert_counted_totals(summary: &HashMap<String, String>) {
-        for (property, expected) in [
-            ("total-data-files", "1"),
-            ("total-records", "13"),
-            ("total-delete-files", "1"),
-            ("total-position-deletes", "1"),
-            ("total-equality-deletes", "0"),
-            ("total-files-size", "877"),
-        ] {
+    /// The fixture's tables after a [`rewrite_summary`] that removes [`REMOVED_DELETE_FILE`]: the
+    /// compacted file plus [`RETAINED_DELETE_FILE`] (100 bytes, one position delete).
+    const COMPACTED_AND_RETAINED_DELETE: [(&str, &str); 6] = [
+        ("total-data-files", "1"),
+        ("total-records", "13"),
+        ("total-delete-files", "1"),
+        ("total-position-deletes", "1"),
+        ("total-equality-deletes", "0"),
+        ("total-files-size", "877"),
+    ];
+
+    fn assert_totals(summary: &HashMap<String, String>, expected_totals: [(&str, &str); 6]) {
+        for (property, expected) in expected_totals {
             assert_eq!(
                 summary.get(property).map(String::as_str),
                 Some(expected),
@@ -1464,7 +1466,11 @@ mod tests {
                 .is_empty()
         );
 
-        assert_counted_totals(&rewrite_summary(&table).await);
+        let removed = position_delete_file(&table, REMOVED_DELETE_FILE);
+        assert_totals(
+            &rewrite_summary(&table, removed).await,
+            COMPACTED_AND_RETAINED_DELETE,
+        );
     }
 
     /// Totals that are present but wrong -- the drifted delete counter, a zeroed size -- are
@@ -1480,6 +1486,95 @@ mod tests {
         ])
         .await;
 
-        assert_counted_totals(&rewrite_summary(&table).await);
+        let removed = position_delete_file(&table, REMOVED_DELETE_FILE);
+        assert_totals(
+            &rewrite_summary(&table, removed).await,
+            COMPACTED_AND_RETAINED_DELETE,
+        );
+    }
+
+    const KEPT_DATA_FILE: &str = "s3://bucket/data/kept.parquet";
+    const EARLIER_REMOVED_DATA_FILE: &str = "s3://bucket/data/earlier-removed.parquet";
+
+    /// The fixture with a head whose list adds a data manifest: [`REWRITTEN_DATA_FILE`] (100 B,
+    /// 10 rows) and [`KEPT_DATA_FILE`] (200 B, 20 rows) live, plus a `Deleted` entry for
+    /// [`EARLIER_REMOVED_DATA_FILE`], which an earlier snapshot removed.
+    async fn table_with_data_manifest() -> Table {
+        let base = make_v2_table_with_delete_manifest().await;
+        let file_io = base.file_io().clone();
+        let location = base.metadata().location().to_string();
+        let mut data_writer = ManifestWriterBuilder::new(
+            file_io
+                .new_output(format!("{location}/metadata/head-data-manifest.avro"))
+                .unwrap(),
+            Some(CHILD_SNAPSHOT_ID),
+            None,
+            base.metadata().current_schema().clone(),
+            base.metadata().default_partition_spec().as_ref().clone(),
+        )
+        .build_v2_data();
+        for file in [
+            data_file(&base, REWRITTEN_DATA_FILE),
+            sized_data_file(&base, KEPT_DATA_FILE, 200, 20),
+        ] {
+            data_writer
+                .add_existing_file(
+                    file,
+                    PARENT_SNAPSHOT_ID,
+                    PARENT_SEQUENCE_NUMBER,
+                    Some(PARENT_SEQUENCE_NUMBER),
+                )
+                .unwrap();
+        }
+        data_writer
+            .add_delete_file(
+                sized_data_file(&base, EARLIER_REMOVED_DATA_FILE, 5000, 500),
+                PARENT_SEQUENCE_NUMBER,
+                Some(PARENT_SEQUENCE_NUMBER),
+            )
+            .unwrap();
+        let data_manifest = data_writer.write_manifest_file().await.unwrap();
+
+        let mut manifests = base
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .load_manifest_list(&file_io, base.metadata())
+            .await
+            .unwrap()
+            .entries()
+            .to_vec();
+        manifests.push(data_manifest);
+        let list_path = format!("{location}/metadata/head-manifest-list.avro");
+        let mut list_writer = ManifestListWriter::v2(
+            file_io.new_output(&list_path).unwrap(),
+            CHILD_SNAPSHOT_ID,
+            Some(PARENT_SNAPSHOT_ID),
+            PARENT_SEQUENCE_NUMBER + 1,
+        );
+        list_writer.add_manifests(manifests.into_iter()).unwrap();
+        list_writer.close().await.unwrap();
+
+        with_head_snapshot(base, &list_path, Summary {
+            operation: Operation::Append,
+            additional_properties: HashMap::new(),
+        })
+    }
+
+    /// The compaction shape: a data file is replaced, so its manifest is rewritten with the file
+    /// marked `Deleted`. Neither that entry nor the one an earlier snapshot left behind is live.
+    #[tokio::test]
+    async fn test_rewrite_counts_only_live_data_files() {
+        let table = table_with_data_manifest().await;
+
+        let removed = data_file(&table, REWRITTEN_DATA_FILE);
+        assert_totals(&rewrite_summary(&table, removed).await, [
+            ("total-data-files", "2"),
+            ("total-records", "33"),
+            ("total-delete-files", "2"),
+            ("total-position-deletes", "2"),
+            ("total-equality-deletes", "0"),
+            ("total-files-size", "1177"),
+        ]);
     }
 }

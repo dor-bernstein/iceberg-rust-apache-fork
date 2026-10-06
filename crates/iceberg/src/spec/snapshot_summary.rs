@@ -190,22 +190,29 @@ struct UpdateMetrics {
 }
 
 impl UpdateMetrics {
+    // Saturating: `LiveFileTotals` feeds this every live entry of manifests other engines wrote,
+    // and a corrupt size or count must not panic the commit (or wrap to a small total).
     fn add_file(&mut self, data_file: &DataFile) {
-        self.added_file_size += data_file.file_size_in_bytes;
+        self.added_file_size = self
+            .added_file_size
+            .saturating_add(data_file.file_size_in_bytes);
         match data_file.content_type() {
             DataContentType::Data => {
-                self.added_data_files += 1;
-                self.added_records += data_file.record_count;
+                self.added_data_files = self.added_data_files.saturating_add(1);
+                self.added_records = self.added_records.saturating_add(data_file.record_count);
             }
             DataContentType::PositionDeletes => {
-                self.added_delete_files += 1;
-                self.added_pos_delete_files += 1;
-                self.added_pos_deletes += data_file.record_count;
+                self.added_delete_files = self.added_delete_files.saturating_add(1);
+                self.added_pos_delete_files = self.added_pos_delete_files.saturating_add(1);
+                self.added_pos_deletes = self
+                    .added_pos_deletes
+                    .saturating_add(data_file.record_count);
             }
             DataContentType::EqualityDeletes => {
-                self.added_delete_files += 1;
-                self.added_eq_delete_files += 1;
-                self.added_eq_deletes += data_file.record_count;
+                self.added_delete_files = self.added_delete_files.saturating_add(1);
+                self.added_eq_delete_files = self.added_eq_delete_files.saturating_add(1);
+                self.added_eq_deletes =
+                    self.added_eq_deletes.saturating_add(data_file.record_count);
             }
         }
     }
