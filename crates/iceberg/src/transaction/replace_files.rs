@@ -1377,4 +1377,124 @@ mod tests {
             delete_targets(&data_file(&table, REWRITTEN_DATA_FILE), &removed, false).is_empty()
         );
     }
+
+    /// The fixture's `main` with its summary replaced by `summary`, on the same manifest list.
+    async fn table_whose_head_summary_is(summary: &[(&str, &str)]) -> Table {
+        let base = make_v2_table_with_delete_manifest().await;
+        let parent = base.metadata().current_snapshot().unwrap();
+        let head = Snapshot::builder()
+            .with_snapshot_id(CHILD_SNAPSHOT_ID)
+            .with_parent_snapshot_id(Some(PARENT_SNAPSHOT_ID))
+            .with_timestamp_ms(base.metadata().last_updated_ms() + 2)
+            .with_sequence_number(PARENT_SEQUENCE_NUMBER + 1)
+            .with_schema_id(0)
+            .with_manifest_list(parent.manifest_list())
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: summary
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            })
+            .build();
+        let metadata = base
+            .metadata()
+            .clone()
+            .into_builder(Some("s3://bucket/test/location/metadata/v2.json".into()))
+            .add_snapshot(head)
+            .unwrap()
+            .set_ref(MAIN_BRANCH, SnapshotReference {
+                snapshot_id: CHILD_SNAPSHOT_ID,
+                retention: SnapshotRetention::Branch {
+                    min_snapshots_to_keep: None,
+                    max_snapshot_age_ms: None,
+                    max_ref_age_ms: None,
+                },
+            })
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        base.with_metadata(Arc::new(metadata))
+    }
+
+    /// Commits a rewrite of `table` that adds one 777-byte, 13-row data file and removes
+    /// [`REMOVED_DELETE_FILE`], and returns the new snapshot's summary.
+    async fn rewrite_summary(table: &Table) -> HashMap<String, String> {
+        let compacted = DataFileBuilder::default()
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .content(DataContentType::Data)
+            .file_path("s3://bucket/data/compacted.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(777)
+            .record_count(13)
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .build()
+            .unwrap();
+        let action = Transaction::new(table)
+            .rewrite_files()
+            .add_data_files([compacted])
+            .delete_files([position_delete_file(table, REMOVED_DELETE_FILE)]);
+
+        let mut commit = Arc::new(action).commit(table).await.unwrap();
+        match commit.take_updates().into_iter().next() {
+            Some(crate::TableUpdate::AddSnapshot { snapshot }) => {
+                snapshot.summary().additional_properties.clone()
+            }
+            other => panic!("expected AddSnapshot first, got {other:?}"),
+        }
+    }
+
+    /// What the table holds after [`rewrite_summary`]: the compacted file plus
+    /// [`RETAINED_DELETE_FILE`] (100 bytes, one position delete).
+    fn assert_counted_totals(summary: &HashMap<String, String>) {
+        for (property, expected) in [
+            ("total-data-files", "1"),
+            ("total-records", "13"),
+            ("total-delete-files", "1"),
+            ("total-position-deletes", "1"),
+            ("total-equality-deletes", "0"),
+            ("total-files-size", "877"),
+        ] {
+            assert_eq!(
+                summary.get(property).map(String::as_str),
+                Some(expected),
+                "{property} in {summary:?}"
+            );
+        }
+    }
+
+    /// A DuckDB-written head carries no totals to roll forward. Rolling forward from nothing used
+    /// to publish `added - removed` (677 bytes here, 0 delete files); the rewrite now counts.
+    #[tokio::test]
+    async fn test_rewrite_counts_totals_when_the_parent_has_none() {
+        let table = make_v2_table_with_delete_manifest().await;
+        assert!(
+            table
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .summary()
+                .additional_properties
+                .is_empty()
+        );
+
+        assert_counted_totals(&rewrite_summary(&table).await);
+    }
+
+    /// Totals that are present but wrong -- the drifted delete counter, a zeroed size -- are
+    /// replaced too, not carried forward.
+    #[tokio::test]
+    async fn test_rewrite_replaces_wrong_parent_totals() {
+        let table = table_whose_head_summary_is(&[
+            ("total-data-files", "40"),
+            ("total-records", "999"),
+            ("total-delete-files", "634"),
+            ("total-position-deletes", "634"),
+            ("total-files-size", "0"),
+        ])
+        .await;
+
+        assert_counted_totals(&rewrite_summary(&table).await);
+    }
 }

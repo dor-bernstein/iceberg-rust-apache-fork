@@ -28,16 +28,16 @@ use uuid::Uuid;
 use crate::error::Result;
 use crate::io::FileIO;
 use crate::spec::{
-    DataContentType, DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestContentType,
-    ManifestEntry, ManifestFile, ManifestListWriter, ManifestStatus, ManifestWriter,
-    ManifestWriterBuilder, Operation, PrimitiveLiteral, Snapshot, SnapshotReference,
-    SnapshotRetention, SnapshotSummaryCollector, Struct, StructType, Summary, TableProperties,
-    UNASSIGNED_SEQUENCE_NUMBER, update_snapshot_summaries,
+    DataContentType, DataFile, DataFileFormat, FormatVersion, LiveFileTotals, MAIN_BRANCH,
+    ManifestContentType, ManifestEntry, ManifestFile, ManifestListWriter, ManifestStatus,
+    ManifestWriter, ManifestWriterBuilder, Operation, PrimitiveLiteral, Snapshot,
+    SnapshotReference, SnapshotRetention, SnapshotSummaryCollector, Struct, StructType, Summary,
+    TableProperties, UNASSIGNED_SEQUENCE_NUMBER, update_snapshot_summaries,
 };
 use crate::table::Table;
 use crate::transaction::{ActionCommit, ManifestFilterManager, ManifestWriterContext};
 use crate::utils::bin::ListPacker;
-use crate::utils::load_manifests;
+use crate::utils::{for_each_manifest, load_manifests};
 use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 
 const META_ROOT_PATH: &str = "metadata";
@@ -732,6 +732,35 @@ partition_struct: {:?}, partition_type: {:?}",
         )
     }
 
+    /// Replaces the summary's rolled-forward `total-*` values with ones counted from `manifests`,
+    /// the full manifest list of the new snapshot.
+    ///
+    /// Rolling forward carries the parent's errors into every later snapshot: DuckDB writes no
+    /// file-size totals and Iceberg's delete counters drift, so a table can report 0 bytes while
+    /// holding a billion rows. A replace leaves the table's rows unchanged and is the commit that
+    /// maintenance makes regularly, so it is where the totals are re-based on the files.
+    ///
+    /// Best effort: if a manifest cannot be read, the rolled-forward totals stand. A summary is
+    /// advisory and must not fail the commit.
+    async fn recompute_totals(&self, summary: &mut Summary, manifests: &[ManifestFile]) {
+        let mut totals = LiveFileTotals::default();
+        let counted = for_each_manifest(
+            self.table.file_io(),
+            manifests.to_vec(),
+            crate::utils::DEFAULT_LOAD_CONCURRENCY_LIMIT,
+            |_, manifest| totals.add_manifest(manifest),
+        )
+        .await;
+        match counted {
+            Ok(()) => totals.apply_to(summary),
+            Err(err) => tracing::warn!(
+                snapshot_id = self.snapshot_id,
+                error = %err,
+                "could not recount snapshot totals from manifests; keeping rolled-forward totals",
+            ),
+        }
+    }
+
     fn generate_manifest_list_file_path(&self, attempt: i64) -> String {
         format!(
             "{}/{}/snap-{}-{}-{}.{}",
@@ -790,13 +819,16 @@ partition_struct: {:?}, partition_type: {:?}",
         // Calling self.summary() before self.manifest_file() is important because self.added_data_files
         // will be set to an empty vec after self.manifest_file() returns, resulting in an empty summary
         // being generated.
-        let summary = self.summary(&snapshot_produce_operation).map_err(|err| {
+        let mut summary = self.summary(&snapshot_produce_operation).map_err(|err| {
             Error::new(ErrorKind::Unexpected, "Failed to create snapshot summary.").with_source(err)
         })?;
 
         let new_manifests = self
             .manifest_file(&snapshot_produce_operation, &process)
             .await?;
+        if summary.operation == Operation::Replace {
+            self.recompute_totals(&mut summary, &new_manifests).await;
+        }
         manifest_list_writer.add_manifests(new_manifests.into_iter())?;
         let writer_next_row_id = manifest_list_writer.next_row_id();
         manifest_list_writer.close().await?;
