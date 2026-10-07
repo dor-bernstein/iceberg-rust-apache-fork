@@ -82,6 +82,12 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
         M::OPERATION
     }
 
+    /// Both modes already read the parent's manifests, and a rewrite is what compaction commits,
+    /// so this is where missing or drifted totals get repaired.
+    fn recounts_totals(&self) -> bool {
+        true
+    }
+
     async fn delete_entries(
         &self,
         snapshot_produce: &SnapshotProducer<'_>,
@@ -698,9 +704,9 @@ mod tests {
 
     use super::{
         CONCURRENT_DELETES_PREFIX, CONCURRENT_REMOVAL_PREFIX, FIELD_ID_POSITIONAL_DELETE_FILE_PATH,
-        MAX_CONFLICTS_IN_MESSAGE, Overwrite, ReplaceFilesMode, ReplaceFilesOperation, Rewrite,
-        RewriteValidationFailure, delete_targets, rewrite_validation_failure,
-        validate_no_conflicting_changes, without_scheme,
+        MAX_CONFLICTS_IN_MESSAGE, Overwrite, ReplaceFilesAction, ReplaceFilesMode,
+        ReplaceFilesOperation, Rewrite, RewriteValidationFailure, delete_targets,
+        rewrite_validation_failure, validate_no_conflicting_changes, without_scheme,
     };
     use crate::catalog::MockCatalog;
     use crate::error::Result;
@@ -846,13 +852,17 @@ mod tests {
     const OTHER_DATA_FILE: &str = "s3://bucket/data/z-other.parquet";
 
     fn data_file(table: &Table, path: &str) -> DataFile {
+        sized_data_file(table, path, 100, 10)
+    }
+
+    fn sized_data_file(table: &Table, path: &str, size: u64, records: u64) -> DataFile {
         DataFileBuilder::default()
             .partition_spec_id(table.metadata().default_partition_spec_id())
             .content(DataContentType::Data)
             .file_path(path.to_string())
             .file_format(DataFileFormat::Parquet)
-            .file_size_in_bytes(100)
-            .record_count(10)
+            .file_size_in_bytes(size)
+            .record_count(records)
             .partition(Struct::from_iter([Some(Literal::long(300))]))
             .build()
             .unwrap()
@@ -961,17 +971,22 @@ mod tests {
         list_writer.add_manifests(manifests.into_iter()).unwrap();
         list_writer.close().await.unwrap();
 
+        with_head_snapshot(base, &list_path, Summary {
+            operation: Operation::Overwrite,
+            additional_properties: HashMap::new(),
+        })
+    }
+
+    /// `base` with [`CHILD_SNAPSHOT_ID`], a child of [`PARENT_SNAPSHOT_ID`], as `main`.
+    fn with_head_snapshot(base: Table, manifest_list: &str, summary: Summary) -> Table {
         let child = Snapshot::builder()
             .with_snapshot_id(CHILD_SNAPSHOT_ID)
             .with_parent_snapshot_id(Some(PARENT_SNAPSHOT_ID))
             .with_timestamp_ms(base.metadata().last_updated_ms() + 2)
             .with_sequence_number(PARENT_SEQUENCE_NUMBER + 1)
             .with_schema_id(0)
-            .with_manifest_list(list_path)
-            .with_summary(Summary {
-                operation: Operation::Overwrite,
-                additional_properties: HashMap::new(),
-            })
+            .with_manifest_list(manifest_list)
+            .with_summary(summary)
             .build();
         let metadata = base
             .metadata()
@@ -1376,5 +1391,229 @@ mod tests {
         assert!(
             delete_targets(&data_file(&table, REWRITTEN_DATA_FILE), &removed, false).is_empty()
         );
+    }
+
+    /// The fixture's `main` with its summary replaced by `summary`, on the same manifest list.
+    async fn table_whose_head_summary_is(summary: &[(&str, &str)]) -> Table {
+        let base = make_v2_table_with_delete_manifest().await;
+        let manifest_list = base
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .manifest_list()
+            .to_string();
+        with_head_snapshot(base, &manifest_list, Summary {
+            operation: Operation::Append,
+            additional_properties: summary
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        })
+    }
+
+    /// Commits a rewrite of `table` that adds one 777-byte, 13-row data file and removes
+    /// `removed`, and returns the new snapshot's summary.
+    async fn rewrite_summary(table: &Table, removed: DataFile) -> HashMap<String, String> {
+        replace_summary::<Rewrite>(table, removed).await
+    }
+
+    /// As [`rewrite_summary`], committed in mode `M`.
+    async fn replace_summary<M: ReplaceFilesMode>(
+        table: &Table,
+        removed: DataFile,
+    ) -> HashMap<String, String> {
+        let compacted = sized_data_file(table, "s3://bucket/data/compacted.parquet", 777, 13);
+        let action = ReplaceFilesAction::<M>::new()
+            .add_data_files([compacted])
+            .delete_files([removed]);
+
+        let mut commit = Arc::new(action).commit(table).await.unwrap();
+        match commit.take_updates().into_iter().next() {
+            Some(crate::TableUpdate::AddSnapshot { snapshot }) => {
+                snapshot.summary().additional_properties.clone()
+            }
+            other => panic!("expected AddSnapshot first, got {other:?}"),
+        }
+    }
+
+    /// The fixture's tables after a [`rewrite_summary`] that removes [`REMOVED_DELETE_FILE`]: the
+    /// compacted file plus [`RETAINED_DELETE_FILE`] (100 bytes, one position delete).
+    const COMPACTED_AND_RETAINED_DELETE: [(&str, &str); 6] = [
+        ("total-data-files", "1"),
+        ("total-records", "13"),
+        ("total-delete-files", "1"),
+        ("total-position-deletes", "1"),
+        ("total-equality-deletes", "0"),
+        ("total-files-size", "877"),
+    ];
+
+    fn assert_totals(summary: &HashMap<String, String>, expected_totals: [(&str, &str); 6]) {
+        for (property, expected) in expected_totals {
+            assert_eq!(
+                summary.get(property).map(String::as_str),
+                Some(expected),
+                "{property} in {summary:?}"
+            );
+        }
+    }
+
+    /// A DuckDB-written head carries no totals to roll forward. Rolling forward from nothing used
+    /// to publish `added - removed` (677 bytes here, 0 delete files); the rewrite now counts.
+    #[tokio::test]
+    async fn test_rewrite_counts_totals_when_the_parent_has_none() {
+        let table = make_v2_table_with_delete_manifest().await;
+        assert!(
+            table
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .summary()
+                .additional_properties
+                .is_empty()
+        );
+
+        let removed = position_delete_file(&table, REMOVED_DELETE_FILE);
+        assert_totals(
+            &rewrite_summary(&table, removed).await,
+            COMPACTED_AND_RETAINED_DELETE,
+        );
+    }
+
+    /// Totals that are present but wrong -- the drifted delete counter, a zeroed size -- are
+    /// replaced too, not carried forward.
+    #[tokio::test]
+    async fn test_rewrite_replaces_wrong_parent_totals() {
+        let table = table_whose_head_summary_is(&[
+            ("total-data-files", "40"),
+            ("total-records", "999"),
+            ("total-delete-files", "634"),
+            ("total-position-deletes", "634"),
+            ("total-files-size", "0"),
+        ])
+        .await;
+
+        let removed = position_delete_file(&table, REMOVED_DELETE_FILE);
+        assert_totals(
+            &rewrite_summary(&table, removed).await,
+            COMPACTED_AND_RETAINED_DELETE,
+        );
+    }
+
+    const KEPT_DATA_FILE: &str = "s3://bucket/data/kept.parquet";
+    const EARLIER_REMOVED_DATA_FILE: &str = "s3://bucket/data/earlier-removed.parquet";
+
+    /// The fixture with a head whose list adds a data manifest: [`REWRITTEN_DATA_FILE`] (100 B,
+    /// 10 rows) and [`KEPT_DATA_FILE`] (200 B, 20 rows) live, plus a `Deleted` entry for
+    /// [`EARLIER_REMOVED_DATA_FILE`], which an earlier snapshot removed.
+    async fn table_with_data_manifest() -> Table {
+        let base = make_v2_table_with_delete_manifest().await;
+        let file_io = base.file_io().clone();
+        let location = base.metadata().location().to_string();
+        let mut data_writer = ManifestWriterBuilder::new(
+            file_io
+                .new_output(format!("{location}/metadata/head-data-manifest.avro"))
+                .unwrap(),
+            Some(CHILD_SNAPSHOT_ID),
+            None,
+            base.metadata().current_schema().clone(),
+            base.metadata().default_partition_spec().as_ref().clone(),
+        )
+        .build_v2_data();
+        for file in [
+            data_file(&base, REWRITTEN_DATA_FILE),
+            sized_data_file(&base, KEPT_DATA_FILE, 200, 20),
+        ] {
+            data_writer
+                .add_existing_file(
+                    file,
+                    PARENT_SNAPSHOT_ID,
+                    PARENT_SEQUENCE_NUMBER,
+                    Some(PARENT_SEQUENCE_NUMBER),
+                )
+                .unwrap();
+        }
+        data_writer
+            .add_delete_file(
+                sized_data_file(&base, EARLIER_REMOVED_DATA_FILE, 5000, 500),
+                PARENT_SEQUENCE_NUMBER,
+                Some(PARENT_SEQUENCE_NUMBER),
+            )
+            .unwrap();
+        let data_manifest = data_writer.write_manifest_file().await.unwrap();
+
+        let mut manifests = base
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .load_manifest_list(&file_io, base.metadata())
+            .await
+            .unwrap()
+            .entries()
+            .to_vec();
+        manifests.push(data_manifest);
+        let list_path = format!("{location}/metadata/head-manifest-list.avro");
+        let mut list_writer = ManifestListWriter::v2(
+            file_io.new_output(&list_path).unwrap(),
+            CHILD_SNAPSHOT_ID,
+            Some(PARENT_SNAPSHOT_ID),
+            PARENT_SEQUENCE_NUMBER + 1,
+        );
+        list_writer.add_manifests(manifests.into_iter()).unwrap();
+        list_writer.close().await.unwrap();
+
+        with_head_snapshot(base, &list_path, Summary {
+            operation: Operation::Append,
+            additional_properties: HashMap::new(),
+        })
+    }
+
+    /// The compaction shape: a data file is replaced, so its manifest is rewritten with the file
+    /// marked `Deleted`. Neither that entry nor the one an earlier snapshot left behind is live.
+    #[tokio::test]
+    async fn test_rewrite_counts_only_live_data_files() {
+        let table = table_with_data_manifest().await;
+
+        let removed = data_file(&table, REWRITTEN_DATA_FILE);
+        assert_totals(
+            &rewrite_summary(&table, removed).await,
+            KEPT_COMPACTED_AND_DELETES,
+        );
+    }
+
+    /// [`table_with_data_manifest`] after replacing [`REWRITTEN_DATA_FILE`] with the compacted
+    /// file: it, [`KEPT_DATA_FILE`] and both position deletes.
+    const KEPT_COMPACTED_AND_DELETES: [(&str, &str); 6] = [
+        ("total-data-files", "2"),
+        ("total-records", "33"),
+        ("total-delete-files", "2"),
+        ("total-position-deletes", "2"),
+        ("total-equality-deletes", "0"),
+        ("total-files-size", "1177"),
+    ];
+
+    /// `overwrite_files` replaces named files and keeps the rest, so its totals are the table's,
+    /// and its removed counters name only the file it replaced. It used to be summarised as a
+    /// full-table truncate: totals of just the compacted file, everything else "removed".
+    #[tokio::test]
+    async fn test_overwrite_counts_the_files_it_kept() {
+        let table = table_with_data_manifest().await;
+
+        let removed = data_file(&table, REWRITTEN_DATA_FILE);
+        let summary = replace_summary::<Overwrite>(&table, removed).await;
+
+        assert_totals(&summary, KEPT_COMPACTED_AND_DELETES);
+        assert_eq!(
+            summary.get("deleted-data-files").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            summary.get("deleted-records").map(String::as_str),
+            Some("10")
+        );
+        assert_eq!(
+            summary.get("removed-files-size").map(String::as_str),
+            Some("100")
+        );
+        assert_eq!(summary.get("removed-delete-files"), None);
     }
 }

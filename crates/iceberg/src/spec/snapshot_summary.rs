@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use itertools::Itertools;
 
 use super::{DataContentType, DataFile, PartitionSpecRef};
-use crate::spec::{ManifestContentType, ManifestFile, Operation, SchemaRef, Summary};
+use crate::spec::{Manifest, ManifestContentType, ManifestFile, Operation, SchemaRef, Summary};
 use crate::{Error, ErrorKind, Result};
 
 const ADDED_DATA_FILES: &str = "added-data-files";
@@ -190,42 +190,57 @@ struct UpdateMetrics {
 }
 
 impl UpdateMetrics {
+    // Saturating: `LiveFileTotals` feeds this every live entry of manifests other engines wrote,
+    // and a corrupt size or count must not panic the commit (or wrap to a small total).
     fn add_file(&mut self, data_file: &DataFile) {
-        self.added_file_size += data_file.file_size_in_bytes;
+        self.added_file_size = self
+            .added_file_size
+            .saturating_add(data_file.file_size_in_bytes);
         match data_file.content_type() {
             DataContentType::Data => {
-                self.added_data_files += 1;
-                self.added_records += data_file.record_count;
+                self.added_data_files = self.added_data_files.saturating_add(1);
+                self.added_records = self.added_records.saturating_add(data_file.record_count);
             }
             DataContentType::PositionDeletes => {
-                self.added_delete_files += 1;
-                self.added_pos_delete_files += 1;
-                self.added_pos_deletes += data_file.record_count;
+                self.added_delete_files = self.added_delete_files.saturating_add(1);
+                self.added_pos_delete_files = self.added_pos_delete_files.saturating_add(1);
+                self.added_pos_deletes = self
+                    .added_pos_deletes
+                    .saturating_add(data_file.record_count);
             }
             DataContentType::EqualityDeletes => {
-                self.added_delete_files += 1;
-                self.added_eq_delete_files += 1;
-                self.added_eq_deletes += data_file.record_count;
+                self.added_delete_files = self.added_delete_files.saturating_add(1);
+                self.added_eq_delete_files = self.added_eq_delete_files.saturating_add(1);
+                self.added_eq_deletes =
+                    self.added_eq_deletes.saturating_add(data_file.record_count);
             }
         }
     }
 
+    // Saturating for the same reason as `add_file`: the removed files' sizes and counts come from
+    // manifests that any engine may have written.
     fn remove_file(&mut self, data_file: &DataFile) {
-        self.removed_file_size += data_file.file_size_in_bytes;
+        self.removed_file_size = self
+            .removed_file_size
+            .saturating_add(data_file.file_size_in_bytes);
         match data_file.content_type() {
             DataContentType::Data => {
-                self.removed_data_files += 1;
-                self.deleted_records += data_file.record_count;
+                self.removed_data_files = self.removed_data_files.saturating_add(1);
+                self.deleted_records = self.deleted_records.saturating_add(data_file.record_count);
             }
             DataContentType::PositionDeletes => {
-                self.removed_delete_files += 1;
-                self.removed_pos_delete_files += 1;
-                self.removed_pos_deletes += data_file.record_count;
+                self.removed_delete_files = self.removed_delete_files.saturating_add(1);
+                self.removed_pos_delete_files = self.removed_pos_delete_files.saturating_add(1);
+                self.removed_pos_deletes = self
+                    .removed_pos_deletes
+                    .saturating_add(data_file.record_count);
             }
             DataContentType::EqualityDeletes => {
-                self.removed_delete_files += 1;
-                self.removed_eq_delete_files += 1;
-                self.removed_eq_deletes += data_file.record_count;
+                self.removed_delete_files = self.removed_delete_files.saturating_add(1);
+                self.removed_eq_delete_files = self.removed_eq_delete_files.saturating_add(1);
+                self.removed_eq_deletes = self
+                    .removed_eq_deletes
+                    .saturating_add(data_file.record_count);
             }
         }
     }
@@ -322,6 +337,35 @@ impl UpdateMetrics {
     }
 }
 
+/// A snapshot's `total-*` values counted from the files it holds, rather than rolled forward from
+/// its parent's summary.
+#[derive(Debug, Default)]
+pub(crate) struct LiveFileTotals(UpdateMetrics);
+
+impl LiveFileTotals {
+    /// Counts every live (added or existing) entry of `manifest`.
+    pub(crate) fn add_manifest(&mut self, manifest: &Manifest) {
+        for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
+            self.0.add_file(entry.data_file());
+        }
+    }
+
+    /// Writes all six totals into `summary`, zeros included, replacing whatever was there.
+    pub(crate) fn apply_to(&self, summary: &mut Summary) {
+        // Every live file was counted as added, so each total is its `added-*` counterpart.
+        summary
+            .additional_properties
+            .extend(totals_equal_to_added(&self.0.to_map()));
+    }
+
+    /// Removes all six totals from `summary`, for when they could not be counted.
+    pub(crate) fn remove_from(summary: &mut Summary) {
+        for (total, _, _) in TOTALS {
+            summary.additional_properties.remove(total);
+        }
+    }
+}
+
 fn set_if_positive<T>(properties: &mut HashMap<String, String>, value: T, property_name: &str)
 where T: PartialOrd + Default + ToString {
     if value > T::default() {
@@ -331,7 +375,7 @@ where T: PartialOrd + Default + ToString {
 
 #[allow(dead_code)]
 pub(crate) fn update_snapshot_summaries(
-    summary: Summary,
+    mut summary: Summary,
     previous_summary: Option<&Summary>,
     truncate_full_table: bool,
 ) -> Result<Summary> {
@@ -347,110 +391,74 @@ pub(crate) fn update_snapshot_summaries(
         ));
     }
 
-    let mut summary = match previous_summary {
+    match previous_summary {
         Some(prev_summary) if truncate_full_table && summary.operation == Operation::Overwrite => {
-            truncate_table_summary(summary, prev_summary)
+            Ok(truncate_table_summary(summary, prev_summary))
         }
-        _ => summary,
-    };
+        _ => {
+            for (total_property, added_property, removed_property) in TOTALS {
+                update_totals(
+                    &mut summary,
+                    previous_summary,
+                    total_property,
+                    added_property,
+                    removed_property,
+                );
+            }
+            Ok(summary)
+        }
+    }
+}
 
-    update_totals(
-        &mut summary,
-        previous_summary,
-        TOTAL_DATA_FILES,
-        ADDED_DATA_FILES,
-        DELETED_DATA_FILES,
-    );
-
-    update_totals(
-        &mut summary,
-        previous_summary,
-        TOTAL_DELETE_FILES,
-        ADDED_DELETE_FILES,
-        REMOVED_DELETE_FILES,
-    );
-
-    update_totals(
-        &mut summary,
-        previous_summary,
-        TOTAL_RECORDS,
-        ADDED_RECORDS,
-        DELETED_RECORDS,
-    );
-
-    update_totals(
-        &mut summary,
-        previous_summary,
-        TOTAL_FILE_SIZE,
-        ADDED_FILE_SIZE,
-        REMOVED_FILE_SIZE,
-    );
-
-    update_totals(
-        &mut summary,
-        previous_summary,
+/// Each `total-*` property with the `added-*` and `removed-*` properties that move it.
+const TOTALS: [(&str, &str, &str); 6] = [
+    (TOTAL_DATA_FILES, ADDED_DATA_FILES, DELETED_DATA_FILES),
+    (TOTAL_DELETE_FILES, ADDED_DELETE_FILES, REMOVED_DELETE_FILES),
+    (TOTAL_RECORDS, ADDED_RECORDS, DELETED_RECORDS),
+    (TOTAL_FILE_SIZE, ADDED_FILE_SIZE, REMOVED_FILE_SIZE),
+    (
         TOTAL_POSITION_DELETES,
         ADDED_POSITION_DELETES,
         REMOVED_POSITION_DELETES,
-    );
-
-    update_totals(
-        &mut summary,
-        previous_summary,
+    ),
+    (
         TOTAL_EQUALITY_DELETES,
         ADDED_EQUALITY_DELETES,
         REMOVED_EQUALITY_DELETES,
-    );
-    Ok(summary)
+    ),
+];
+
+/// A summary value as a `u64`. Any engine may write these, so a malformed, empty or overflowing
+/// value must not panic the writer: it reads as `None`.
+fn parse_u64(value: Option<&String>) -> Option<u64> {
+    value?.parse().ok()
 }
 
-/// Read a `total_*` property from a previous summary as a `u64`.
-///
-/// Snapshot summary values are decimal strings inside a
-/// `HashMap<String, String>` and may be written by any Iceberg engine
-/// (Java, Python, Rust, ...). A malformed entry, an empty string, or a
-/// value exceeding `u64::MAX` must not panic the writer — we treat any
-/// unparsable value as `0`, matching the policy in `update_totals`.
-#[allow(dead_code)]
-fn previous_total_or_zero(previous_summary: &Summary, prop: &str) -> u64 {
-    previous_summary
-        .additional_properties
-        .get(prop)
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0)
+/// Every `total-*` set to its `added-*` counterpart in `properties`, an absent one counting as 0.
+fn totals_equal_to_added(properties: &HashMap<String, String>) -> Vec<(String, String)> {
+    TOTALS
+        .iter()
+        .map(|(total, added, _)| {
+            let value = parse_u64(properties.get(*added)).unwrap_or(0);
+            (total.to_string(), value.to_string())
+        })
+        .collect()
 }
 
+/// A full-table overwrite: every earlier file is gone, so each `removed-*` is the previous total
+/// (when it can be read) and each total is exactly what this snapshot added.
 #[allow(dead_code)]
 fn truncate_table_summary(mut summary: Summary, previous_summary: &Summary) -> Summary {
-    for prop in [
-        TOTAL_DATA_FILES,
-        TOTAL_DELETE_FILES,
-        TOTAL_RECORDS,
-        TOTAL_FILE_SIZE,
-        TOTAL_POSITION_DELETES,
-        TOTAL_EQUALITY_DELETES,
-    ] {
-        summary
-            .additional_properties
-            .insert(prop.to_string(), "0".to_string());
-    }
-
-    for (total_prop, removed_prop) in [
-        (TOTAL_DATA_FILES, DELETED_DATA_FILES),
-        (TOTAL_DELETE_FILES, REMOVED_DELETE_FILES),
-        (TOTAL_RECORDS, DELETED_RECORDS),
-        (TOTAL_FILE_SIZE, REMOVED_FILE_SIZE),
-        (TOTAL_POSITION_DELETES, REMOVED_POSITION_DELETES),
-        (TOTAL_EQUALITY_DELETES, REMOVED_EQUALITY_DELETES),
-    ] {
-        let value = previous_total_or_zero(previous_summary, total_prop);
+    for (total_prop, _, removed_prop) in TOTALS {
+        let value = parse_u64(previous_summary.additional_properties.get(total_prop)).unwrap_or(0);
         if value != 0 {
             summary
                 .additional_properties
                 .insert(removed_prop.to_string(), value.to_string());
         }
     }
-
+    let totals = totals_equal_to_added(&summary.additional_properties);
+    summary.additional_properties.extend(totals);
     summary
 }
 
@@ -462,29 +470,45 @@ fn update_totals(
     added_property: &str,
     removed_property: &str,
 ) {
-    // Snapshot summary values are stored as decimal strings inside a
-    // `HashMap<String, String>` and are written by any Iceberg engine (Java,
-    // Python, Rust, ...). We must not panic if a value is missing, malformed,
-    // or exceeds `u64::MAX` — that aborts the writer and produces no progress
-    // signal. Treat any unparsable value as `0` (the same as a missing
-    // entry) and use saturating arithmetic so a `removed > previous + added`
-    // skew from a corrupt history can never underflow.
-    fn parse_or_zero(value: Option<&String>) -> u64 {
-        value.and_then(|v| v.parse::<u64>().ok()).unwrap_or(0)
+    // A total rolled forward from a previous value that is missing or unparsable is unknown, not
+    // zero: DuckDB omits the file-size totals entirely, and writing `added - removed` in their
+    // place publishes a confident wrong number that planners read as table size. So, as Java's
+    // `SnapshotProducer.updateTotal` does, the total is left out when the previous one cannot be
+    // read or the result would be negative. Only a table's first snapshot starts from zero.
+    let previous_total = match previous_summary {
+        None => Some(0),
+        Some(previous_summary) => {
+            parse_u64(previous_summary.additional_properties.get(total_property))
+        }
+    };
+    let new_total = rolled_total(
+        previous_total,
+        &summary.additional_properties,
+        added_property,
+        removed_property,
+    );
+    if let Some(total) = new_total {
+        summary
+            .additional_properties
+            .insert(total_property.to_string(), total.to_string());
     }
+}
 
-    let previous_total = previous_summary.map_or(0, |previous_summary| {
-        parse_or_zero(previous_summary.additional_properties.get(total_property))
-    });
-
-    let added = parse_or_zero(summary.additional_properties.get(added_property));
-    let removed = parse_or_zero(summary.additional_properties.get(removed_property));
-
-    let new_total = previous_total.saturating_add(added).saturating_sub(removed);
-
-    summary
-        .additional_properties
-        .insert(total_property.to_string(), new_total.to_string());
+/// `previous + added - removed`, or `None` if any part is unreadable or the result is negative.
+/// An absent delta counts as 0.
+fn rolled_total(
+    previous: Option<u64>,
+    properties: &HashMap<String, String>,
+    added_property: &str,
+    removed_property: &str,
+) -> Option<u64> {
+    let delta = |property: &str| match properties.get(property) {
+        None => Some(0),
+        value => parse_u64(value),
+    };
+    previous?
+        .checked_add(delta(added_property)?)?
+        .checked_sub(delta(removed_property)?)
 }
 
 #[cfg(test)]
@@ -500,8 +524,8 @@ mod tests {
 
     /// Previous-summary values that overflow `u64` (e.g. written by a
     /// non-Rust engine using unbounded integers) used to panic with
-    /// `ParseIntError { kind: PosOverflow }` inside `update_totals`. They
-    /// must now be treated as `0` so compaction can still make progress.
+    /// `ParseIntError { kind: PosOverflow }` inside `update_totals`. The total
+    /// they feed is unknown, so it is left out; the others still roll forward.
     #[test]
     fn test_update_totals_handles_overflowing_previous_total() {
         // > u64::MAX (= 18_446_744_073_709_551_615)
@@ -530,10 +554,9 @@ mod tests {
 
         let updated = update_snapshot_summaries(summary, Some(&previous_summary), false).unwrap();
 
-        // Overflowing previous total is reset to 0, then `added` is applied.
-        assert_eq!(
-            updated.additional_properties.get(TOTAL_FILE_SIZE).unwrap(),
-            "400"
+        assert!(
+            !updated.additional_properties.contains_key(TOTAL_FILE_SIZE),
+            "an unreadable previous total must not become `added`"
         );
         // Non-overflowing values still aggregate correctly.
         assert_eq!(
@@ -544,9 +567,10 @@ mod tests {
 
     /// A corrupt history could leave `removed > previous + added`, which
     /// used to panic on `new_total -= value` in debug builds and silently
-    /// wrap in release. `saturating_sub` clamps the result to `0`.
+    /// wrap in release. The previous total is evidently wrong, so the new one
+    /// is left out rather than clamped to `0`.
     #[test]
-    fn test_update_totals_saturates_on_underflow() {
+    fn test_update_totals_omits_total_on_underflow() {
         let prev_props: HashMap<String, String> = [(TOTAL_RECORDS.to_string(), "5".to_string())]
             .into_iter()
             .collect();
@@ -568,16 +592,13 @@ mod tests {
 
         let updated = update_snapshot_summaries(summary, Some(&previous_summary), false).unwrap();
 
-        assert_eq!(
-            updated.additional_properties.get(TOTAL_RECORDS).unwrap(),
-            "0"
-        );
+        assert!(!updated.additional_properties.contains_key(TOTAL_RECORDS));
     }
 
-    /// Non-numeric or empty values must not panic — they are treated the
-    /// same as a missing entry (value `0`).
+    /// Non-numeric or empty values must not panic. Like a missing entry, they
+    /// leave the total unknown, so it is left out.
     #[test]
-    fn test_update_totals_treats_malformed_value_as_zero() {
+    fn test_update_totals_omits_total_for_malformed_previous_value() {
         let prev_props: HashMap<String, String> = [
             (TOTAL_RECORDS.to_string(), "garbage".to_string()),
             (TOTAL_FILE_SIZE.to_string(), "".to_string()),
@@ -602,14 +623,93 @@ mod tests {
 
         let updated = update_snapshot_summaries(summary, Some(&previous_summary), false).unwrap();
 
-        assert_eq!(
-            updated.additional_properties.get(TOTAL_RECORDS).unwrap(),
-            "7"
+        assert!(!updated.additional_properties.contains_key(TOTAL_RECORDS));
+        assert!(!updated.additional_properties.contains_key(TOTAL_FILE_SIZE));
+    }
+
+    fn summary(operation: Operation, properties: &[(&str, &str)]) -> Summary {
+        Summary {
+            operation,
+            additional_properties: properties
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    /// The production case: DuckDB 1.5's native writes keep the count totals
+    /// but write no file-size keys at all. A rewrite after one used to publish
+    /// `added - removed` as the table's size (0.5 MB for a 48M-row table, 0 for
+    /// 1.46B rows), which Spark then planned as broadcastable.
+    #[test]
+    fn test_update_totals_omits_size_after_a_parent_without_size_totals() {
+        let duckdb_append = summary(Operation::Append, &[
+            (ADDED_DATA_FILES, "2"),
+            (ADDED_RECORDS, "114179"),
+            (DELETED_DATA_FILES, "0"),
+            (DELETED_RECORDS, "0"),
+            (TOTAL_DATA_FILES, "30"),
+            (TOTAL_DELETE_FILES, "0"),
+            (TOTAL_POSITION_DELETES, "0"),
+            (TOTAL_RECORDS, "47982787"),
+        ]);
+        let rewrite = summary(Operation::Replace, &[
+            (ADDED_DATA_FILES, "1"),
+            (DELETED_DATA_FILES, "8"),
+            (ADDED_RECORDS, "522620"),
+            (DELETED_RECORDS, "522620"),
+            (ADDED_FILE_SIZE, "68617442"),
+            (REMOVED_FILE_SIZE, "68122332"),
+        ]);
+
+        let updated = update_snapshot_summaries(rewrite, Some(&duckdb_append), false).unwrap();
+        let props = &updated.additional_properties;
+
+        assert!(
+            !props.contains_key(TOTAL_FILE_SIZE),
+            "got total-files-size={:?}",
+            props.get(TOTAL_FILE_SIZE)
         );
+        assert!(!props.contains_key(TOTAL_EQUALITY_DELETES));
+        assert_eq!(props.get(TOTAL_RECORDS).unwrap(), "47982787");
+        assert_eq!(props.get(TOTAL_DATA_FILES).unwrap(), "23");
+        assert_eq!(props.get(TOTAL_DELETE_FILES).unwrap(), "0");
+    }
+
+    /// When a recount fails the totals go, including a small one rolled forward
+    /// from a fabricated parent; the rest of the summary stays.
+    #[test]
+    fn test_live_file_totals_remove_from_drops_only_totals() {
+        let mut rewrite = summary(Operation::Replace, &[
+            (ADDED_FILE_SIZE, "777"),
+            (TOTAL_FILE_SIZE, "529306"),
+            (TOTAL_RECORDS, "47982787"),
+            (TOTAL_DATA_FILES, "23"),
+        ]);
+
+        LiveFileTotals::remove_from(&mut rewrite);
+
         assert_eq!(
-            updated.additional_properties.get(TOTAL_FILE_SIZE).unwrap(),
-            "70"
+            rewrite.additional_properties,
+            HashMap::from([(ADDED_FILE_SIZE.to_string(), "777".to_string())])
         );
+    }
+
+    /// A table's first snapshot has no previous total to be missing: it starts
+    /// from zero.
+    #[test]
+    fn test_update_totals_start_from_zero_without_a_previous_snapshot() {
+        let first = summary(Operation::Append, &[
+            (ADDED_RECORDS, "7"),
+            (ADDED_FILE_SIZE, "70"),
+        ]);
+
+        let updated = update_snapshot_summaries(first, None, false).unwrap();
+        let props = &updated.additional_properties;
+
+        assert_eq!(props.get(TOTAL_RECORDS).unwrap(), "7");
+        assert_eq!(props.get(TOTAL_FILE_SIZE).unwrap(), "70");
+        assert_eq!(props.get(TOTAL_DATA_FILES).unwrap(), "0");
     }
 
     /// The truncate-overwrite path used to parse previous-summary totals via
