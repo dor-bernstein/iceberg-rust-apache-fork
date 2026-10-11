@@ -22,7 +22,7 @@ pub(crate) const ICEBERG_FIELD_OPTIONAL: &str = "iceberg.field.optional";
 /// Property `iceberg.field.current` for `Column`
 pub(crate) const ICEBERG_FIELD_CURRENT: &str = "iceberg.field.current";
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use aws_sdk_glue::types::Column;
 use iceberg::spec::{PrimitiveType, SchemaVisitor, TableMetadata, VariantType, visit_schema};
@@ -37,6 +37,8 @@ pub(crate) struct GlueSchemaBuilder {
     schema: GlueSchema,
     is_current: bool,
     depth: usize,
+    /// Top-level names already emitted. See [`Self::field`].
+    emitted_column_names: HashSet<String>,
 }
 
 impl GlueSchemaBuilder {
@@ -48,6 +50,7 @@ impl GlueSchemaBuilder {
             schema: Vec::new(),
             is_current: true,
             depth: 0,
+            emitted_column_names: HashSet::new(),
         };
 
         visit_schema(current_schema, &mut builder)?;
@@ -112,6 +115,14 @@ impl SchemaVisitor for GlueSchemaBuilder {
     ) -> iceberg::Result<String> {
         if self.is_inside_struct() {
             return Ok(format!("{}:{}", field.name, &value));
+        }
+
+        // A repeated name makes Athena silently skip query-result reuse for the table, and
+        // `from_iceberg` walks every schema version. The current schema is visited first, so
+        // keeping the first occurrence keeps a live name's current type. Matches Iceberg
+        // Java's `IcebergToGlueConverter.toColumns` and pyiceberg's `_to_columns`.
+        if !self.emitted_column_names.insert(field.name.clone()) {
+            return Ok(value);
         }
 
         let parameters = HashMap::from([
@@ -220,10 +231,30 @@ mod tests {
         id: impl Into<String>,
         optional: bool,
     ) -> Result<Column> {
+        create_column_with_current(name, r#type, id, optional, true)
+    }
+
+    /// A column carried only by an older schema version.
+    fn create_historical_column(
+        name: impl Into<String>,
+        r#type: impl Into<String>,
+        id: impl Into<String>,
+        optional: bool,
+    ) -> Result<Column> {
+        create_column_with_current(name, r#type, id, optional, false)
+    }
+
+    fn create_column_with_current(
+        name: impl Into<String>,
+        r#type: impl Into<String>,
+        id: impl Into<String>,
+        optional: bool,
+        is_current: bool,
+    ) -> Result<Column> {
         let parameters = HashMap::from([
             (ICEBERG_FIELD_ID.to_string(), id.into()),
             (ICEBERG_FIELD_OPTIONAL.to_string(), optional.to_string()),
-            (ICEBERG_FIELD_CURRENT.to_string(), "true".to_string()),
+            (ICEBERG_FIELD_CURRENT.to_string(), is_current.to_string()),
         ]);
 
         Column::builder()
@@ -558,6 +589,200 @@ mod tests {
         let expected = vec![create_column("v", "variant", "1", false)?];
 
         assert_eq!(result, expected);
+        Ok(())
+    }
+    #[test]
+    fn test_schema_history_emits_each_column_name_once() -> Result<()> {
+        // The three ways a name recurs across schema versions.
+        let initial = r#"{
+            "type": "struct",
+            "schema-id": 0,
+            "fields": [
+                {"id": 1, "name": "id", "required": true, "type": "string"},
+                {"id": 2, "name": "hit_count", "required": false, "type": "int"},
+                {"id": 3, "name": "legacy_flag", "required": false, "type": "boolean"}
+            ]
+        }"#;
+        // int -> long promotion, a drop, and a reorder.
+        let evolved = r#"{
+            "type": "struct",
+            "schema-id": 1,
+            "fields": [
+                {"id": 2, "name": "hit_count", "required": false, "type": "long"},
+                {"id": 1, "name": "id", "required": true, "type": "string"}
+            ]
+        }"#;
+
+        let table_creation = TableCreation::builder()
+            .name("my_table".to_string())
+            .location("my_location".to_string())
+            .schema(serde_json::from_str::<Schema>(initial)?)
+            .format_version(FormatVersion::V2)
+            .build();
+        let metadata = TableMetadataBuilder::from_table_creation(table_creation)?
+            .add_current_schema(serde_json::from_str::<Schema>(evolved)?)?
+            .build()?
+            .metadata;
+
+        // Guards the test itself: the builder must really walk two schemas.
+        assert_eq!(metadata.schemas_iter().count(), 2);
+
+        let result = GlueSchemaBuilder::from_iceberg(&metadata)?.build();
+
+        let expected = vec![
+            // Current schema first, in its own field order, then the dropped column once.
+            create_column("hit_count", "bigint", "2", true)?,
+            create_column("id", "string", "1", false)?,
+            create_historical_column("legacy_flag", "boolean", "3", true)?,
+        ];
+
+        assert_eq!(result, expected);
+
+        let names: Vec<&str> = result.iter().map(|c| c.name()).collect();
+        let unique: HashSet<&str> = names.iter().copied().collect();
+        assert_eq!(
+            names.len(),
+            unique.len(),
+            "Glue column names must be unique"
+        );
+
+        Ok(())
+    }
+
+    /// A table with a realistic amount of history: twelve live columns across three
+    /// schema versions -- an original, a reorder, and an int -> long promotion -- plus a
+    /// column dropped on the way.
+    fn evolved_table_metadata() -> Result<TableMetadata> {
+        const LIVE: [(&str, &str); 12] = [
+            ("id", "string"),
+            ("owner_id", "string"),
+            ("category_id", "string"),
+            ("group_id", "string"),
+            ("created_at", "timestamptz"),
+            ("updated_at", "timestamptz"),
+            ("source", "string"),
+            ("action", "string"),
+            ("resource", "string"),
+            ("payload", "string"),
+            ("hit_count", "int"),
+            ("miss_count", "long"),
+        ];
+
+        let field_json = |id: usize, name: &str, ftype: &str| {
+            format!(r#"{{"id": {id}, "name": "{name}", "required": false, "type": "{ftype}"}}"#)
+        };
+        let schema_json = |schema_id: i32, fields: Vec<String>| {
+            serde_json::from_str::<Schema>(&format!(
+                r#"{{"type": "struct", "schema-id": {schema_id}, "fields": [{}]}}"#,
+                fields.join(",")
+            ))
+        };
+
+        // v0: original order, `hit_count` int, plus `legacy_column` (dropped later).
+        let mut v0: Vec<String> = LIVE
+            .iter()
+            .enumerate()
+            .map(|(i, (name, ftype))| field_json(i + 1, name, ftype))
+            .collect();
+        v0.push(field_json(99, "legacy_column", "string"));
+
+        // v1: the two counters move to the end. `hit_count` still int.
+        let reorder = |hit_type: &str| -> Vec<String> {
+            let mut out: Vec<String> = LIVE
+                .iter()
+                .enumerate()
+                .filter(|(_, (name, _))| *name != "hit_count" && *name != "miss_count")
+                .map(|(i, (name, ftype))| field_json(i + 1, name, ftype))
+                .collect();
+            out.push(field_json(11, "hit_count", hit_type));
+            out.push(field_json(12, "miss_count", "long"));
+            out
+        };
+
+        Ok(TableMetadataBuilder::from_table_creation(
+            TableCreation::builder()
+                .name("my_table".to_string())
+                .location("my_location".to_string())
+                .schema(schema_json(0, v0)?)
+                .format_version(FormatVersion::V2)
+                .build(),
+        )?
+        .add_current_schema(schema_json(1, reorder("int"))?)?
+        // The type promotion.
+        .add_current_schema(schema_json(2, reorder("long"))?)?
+        .build()?
+        .metadata)
+    }
+
+    #[test]
+    fn test_evolved_table_yields_one_column_per_name() -> Result<()> {
+        let metadata = evolved_table_metadata()?;
+        // Guards the fixture: three versions is what triggers the 3x duplication.
+        assert_eq!(metadata.schemas_iter().count(), 3);
+
+        let result = GlueSchemaBuilder::from_iceberg(&metadata)?.build();
+
+        // 12 live + the dropped one. Before the fix this was 37 entries for 13 names.
+        assert_eq!(result.len(), 13);
+        let names: Vec<&str> = result.iter().map(|c| c.name()).collect();
+        let unique: HashSet<&str> = names.iter().copied().collect();
+        assert_eq!(names.len(), unique.len(), "repeated names: {names:?}");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_evolved_table_keeps_current_type_for_promoted_column() -> Result<()> {
+        let result = GlueSchemaBuilder::from_iceberg(&evolved_table_metadata()?)?.build();
+
+        // The int -> long promotion: the surviving entry must be the CURRENT type, not the
+        // `int` that two older schemas still carry.
+        let denied: Vec<&Column> = result.iter().filter(|c| c.name() == "hit_count").collect();
+        assert_eq!(denied.len(), 1);
+        assert_eq!(denied[0].r#type(), Some("bigint"));
+        assert_eq!(
+            denied[0].parameters().unwrap().get(ICEBERG_FIELD_CURRENT),
+            Some(&"true".to_string())
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_evolved_table_retains_dropped_column_once() -> Result<()> {
+        let result = GlueSchemaBuilder::from_iceberg(&evolved_table_metadata()?)?.build();
+
+        // Dedupe, not current-only: a dropped column stays resolvable for old data, exactly
+        // once, flagged historical. This is what pyiceberg and Iceberg Java also emit.
+        let legacy: Vec<&Column> = result
+            .iter()
+            .filter(|c| c.name() == "legacy_column")
+            .collect();
+        assert_eq!(legacy.len(), 1);
+        assert_eq!(
+            legacy[0].parameters().unwrap().get(ICEBERG_FIELD_CURRENT),
+            Some(&"false".to_string())
+        );
+
+        // And it is the ONLY historical entry. Without dedupe the two older schemas
+        // contribute a second copy of all 12 live names here, which is the defect.
+        let historical_count = result
+            .iter()
+            .filter(|c| {
+                c.parameters().unwrap().get(ICEBERG_FIELD_CURRENT) == Some(&"false".to_string())
+            })
+            .count();
+        assert_eq!(historical_count, 1);
+
+        // Every live column is flagged current.
+        let current_count = result
+            .iter()
+            .filter(|c| {
+                c.parameters().unwrap().get(ICEBERG_FIELD_CURRENT) == Some(&"true".to_string())
+            })
+            .count();
+        assert_eq!(current_count, 12);
+
         Ok(())
     }
 }
