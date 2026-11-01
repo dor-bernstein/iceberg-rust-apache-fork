@@ -33,24 +33,33 @@ use crate::spec::{DataContentType, DataFile, Struct};
 // `writer/base_writer/position_delete_file_writer.rs`.
 const FIELD_ID_POSITIONAL_DELETE_FILE_PATH: i32 = 2147483546;
 
+// duckdb-iceberg v1.5 keys a position delete's `file_path` bounds under `_file` instead
+// (`MultiFileReader::FILENAME_FIELD_ID`); fixed upstream in duckdb-iceberg 5dea51fcc. `_file` has no
+// meaning in a position delete's bounds otherwise, so equal bounds there name the single target too.
+const FIELD_ID_DUCKDB_V1_5_POSITIONAL_DELETE_FILE_PATH: i32 =
+    crate::metadata_columns::RESERVED_FIELD_ID_FILE;
+
 fn try_infer_single_referenced_data_file_from_bounds(delete_file: &DataFile) -> Option<String> {
     // Match Iceberg Java's `DeleteFileUtil.referencedDataFile(DeleteFile)` heuristic:
     // if lower and upper bounds for PATH_ID are present and equal, the delete file
     // targets a single data file.
-    let lower = delete_file
-        .lower_bounds
-        .get(&FIELD_ID_POSITIONAL_DELETE_FILE_PATH)?;
-    let upper = delete_file
-        .upper_bounds
-        .get(&FIELD_ID_POSITIONAL_DELETE_FILE_PATH)?;
+    [
+        FIELD_ID_POSITIONAL_DELETE_FILE_PATH,
+        FIELD_ID_DUCKDB_V1_5_POSITIONAL_DELETE_FILE_PATH,
+    ]
+    .into_iter()
+    .find_map(|field_id| {
+        let lower = delete_file.lower_bounds.get(&field_id)?;
+        let upper = delete_file.upper_bounds.get(&field_id)?;
 
-    if lower != upper {
-        return None;
-    }
+        if lower != upper {
+            return None;
+        }
 
-    let bytes = lower.to_bytes().ok()?;
-    let path = std::str::from_utf8(bytes.as_ref()).ok()?;
-    Some(path.to_string())
+        let bytes = lower.to_bytes().ok()?;
+        let path = std::str::from_utf8(bytes.as_ref()).ok()?;
+        Some(path.to_string())
+    })
 }
 
 /// Index of delete files
@@ -745,6 +754,96 @@ mod tests {
 
         let deletes_for_b = delete_file_index.get_deletes_for_data_file(&data_b, Some(0));
         assert_eq!(deletes_for_b.len(), 1);
+    }
+
+    fn build_duckdb_v1_5_pos_delete_file(
+        path: &str,
+        lower: &str,
+        upper: &str,
+        partition: &Struct,
+        spec_id: i32,
+    ) -> DataFile {
+        DataFileBuilder::default()
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .content(DataContentType::PositionDeletes)
+            .record_count(1)
+            .partition(partition.clone())
+            .partition_spec_id(spec_id)
+            .file_size_in_bytes(100)
+            .referenced_data_file(None)
+            .lower_bounds(HashMap::from([(
+                FIELD_ID_DUCKDB_V1_5_POSITIONAL_DELETE_FILE_PATH,
+                Datum::string(lower),
+            )]))
+            .upper_bounds(HashMap::from([(
+                FIELD_ID_DUCKDB_V1_5_POSITIONAL_DELETE_FILE_PATH,
+                Datum::string(upper),
+            )]))
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_pos_deletes_duckdb_v1_5_file_bounds_prune_to_single_file() {
+        let partition = test_partition();
+        let spec_id = 1;
+
+        let data_a = build_test_data_file("s3://bucket/data-a.parquet", &partition, spec_id);
+        let compacted = build_test_data_file("s3://bucket/compacted.parquet", &partition, spec_id);
+        let delete_file_index = build_populated_delete_file_index(spec_id, vec![(
+            10,
+            build_duckdb_v1_5_pos_delete_file(
+                "s3://bucket/pos-delete-a.parquet",
+                data_a.file_path(),
+                data_a.file_path(),
+                &partition,
+                spec_id,
+            ),
+        )]);
+
+        assert_eq!(
+            get_sorted_delete_paths(&delete_file_index, &data_a, Some(0)),
+            vec!["s3://bucket/pos-delete-a.parquet".to_string()]
+        );
+        // A rewrite of data-a committed at the delete's own sequence number must not inherit it.
+        assert!(
+            delete_file_index
+                .get_deletes_for_data_file(&compacted, Some(10))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_pos_deletes_duckdb_v1_5_file_bounds_range_does_not_prune() {
+        let partition = test_partition();
+        let spec_id = 1;
+
+        let data_a = build_test_data_file("s3://bucket/data-a.parquet", &partition, spec_id);
+        let data_b = build_test_data_file("s3://bucket/data-b.parquet", &partition, spec_id);
+        let delete_file_index = build_populated_delete_file_index(spec_id, vec![(
+            10,
+            build_duckdb_v1_5_pos_delete_file(
+                "s3://bucket/pos-delete-range.parquet",
+                data_a.file_path(),
+                data_b.file_path(),
+                &partition,
+                spec_id,
+            ),
+        )]);
+
+        assert_eq!(
+            delete_file_index
+                .get_deletes_for_data_file(&data_a, Some(0))
+                .len(),
+            1
+        );
+        assert_eq!(
+            delete_file_index
+                .get_deletes_for_data_file(&data_b, Some(0))
+                .len(),
+            1
+        );
     }
 
     #[test]
